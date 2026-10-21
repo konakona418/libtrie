@@ -238,5 +238,5 @@ examples/http_server.cc coroutine/epoll 服务端 + JSON 示例
 - 没有 JSON 到 schema 的校验、没有 multipart、没有 streaming body。
 - 路径参数与 query/header 参数不支持枚举、自定义类型（JSON body 支持枚举）。
 - 路由模板上限 95 字符、路径 32 段、handler 参数 12 个。
-- 编译期成本随路由数增长；未使用方法和路径子树会被裁剪。实测 24 条 GET 路由约 2.5 s，
-  28 条覆盖 7 个方法的路由约 3 s（GCC 16.2，`-O0`；含 nlohmann 头文件后略有增加）。
+- 编译期成本随路由数增长；未使用方法和路径子树会被裁剪。实测 24 条 GET 路由约 5 s，
+  28 条覆盖 7 个方法的路由约 5 s（GCC 16.2，`-O0`，包含 nlohmann-json 头文件的解析成本）。
