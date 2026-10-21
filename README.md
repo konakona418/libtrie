@@ -10,14 +10,16 @@ A C++26 reflection HTTP framework built on P2996 (reflection), P3394
   (one coroutine per connection, single-threaded event loop).
 - **JSON.** Vendored [nlohmann/json](https://github.com/nlohmann/json) plus a
   reflection layer that converts aggregate types to/from JSON.
-- **Schema validation.** Typed request bodies are validated against a schema
-  derived from the C++ type before the handler runs.
+- **Schema validation with hooks.** Typed request bodies are validated against a
+  schema derived from the C++ type before the handler runs; strictness, extra
+  validators and error responses are configurable per server.
 - **Middleware.** Spring-like request-scoped context injection
   (`[[=trie::inject]] T&`), an ordered middleware chain, and an optional SQLite
   transaction middleware.
 - **Type-safe client.** Method, path, parameters and return type come from the
-  same reflection metadata; calls are checked at compile time. Ships with a
-  blocking `socket_transport` and a pluggable transport concept.
+  same reflection metadata; calls are checked at compile time. Ships with
+  blocking `socket_transport`, pooled `pooled_socket_transport`, OpenSSL-based
+  `tls_transport`, and a pluggable transport concept.
 
 ## Requirements
 
@@ -26,6 +28,8 @@ A C++26 reflection HTTP framework built on P2996 (reflection), P3394
 - **Linux** for the HTTP transport (epoll). Routing, JSON, middleware and the
   client core are platform-independent.
 - Optional: SQLite 3 development files for the SQLite middleware example/test.
+- Optional: OpenSSL development files for `trie/http/tls_transport.hh` (the TLS
+  client transport is an opt-in header, not part of the umbrella include).
 
 Stock Clang does not implement P2996 yet; clangd cannot parse `^^`/`[[=...]]`
 either, so expect editor false positives. The build is the source of truth.
@@ -42,7 +46,7 @@ git submodule update --init --recursive
 git submodule update --init --recursive
 cmake --preset dev
 cmake --build --preset dev
-ctest --preset dev            # 13 tests, including real-socket integration tests
+ctest --preset dev            # 16 tests (TLS test when OpenSSL is found)
 ```
 
 Examples:
@@ -236,6 +240,38 @@ trie::json::value description = trie::json::schema<person>();
 `schema<T>()` emits draft-07-style object/properties/required/items/enum/
 minItems/maxItems.
 
+Servers expose three validation hooks:
+
+```cpp
+router.set_validation_options(trie::json::validate_options{
+    .reject_unknown = false,      // accept unknown JSON fields
+    .require_all = true,          // every member is required
+});
+
+// Extra validation after the built-in schema checks (may use middleware context).
+router.on_body_validation([](const trie::http::request_view& request,
+                             std::string_view type_name,
+                             const trie::json::value& body,
+                             trie::http::context& context)
+                              -> std::expected<void, std::string> {
+  if (body.contains("age") && body["age"].get<int>() > 150) return std::unexpected("age must be <= 150");
+  return {};
+});
+
+// Customize the response for parse/schema/hook failures.
+router.on_validation_error([](const trie::validation_failure& failure, trie::http::context& context) {
+  trie::http::response response{};
+  response.status_code = 422;
+  response.set_header("Content-Type", "application/json");
+  response.body = R"({"error":")" + failure.message + R"(","type":")" + std::string(failure.type_name) + R"("})";
+  return response;
+});
+```
+
+The body validator receives the reflected C++ type name and runs after schema
+validation; the error handler also covers malformed JSON and plain parameter
+conversion failures (e.g. `/users/not-a-number`).
+
 ### Type-safe client
 
 The client derives method, path template, argument types and return type from
@@ -271,7 +307,36 @@ auto user = http_client.call<^^users_api::get_user>(21);
 ```
 
 `socket_transport_options{connect_timeout_ms, io_timeout_ms, max_response_bytes}`
-configures timeouts and response size limits. The transport concept is:
+configures timeouts and response size limits.
+
+For keep-alive connection reuse use `pooled_socket_transport` (thread-safe,
+retries once on a dead pooled connection):
+
+```cpp
+trie::client<users_api, trie::http::pooled_socket_transport> client{
+    trie::http::pooled_socket_transport{
+        trie::http::endpoint{"127.0.0.1", 8080},
+        trie::http::pooled_socket_transport_options{.max_idle_connections = 8}}};
+```
+
+TLS is an opt-in OpenSSL transport (link `-lssl -lcrypto`, include the header
+explicitly; it is not pulled in by `trie/trie.hh`):
+
+```cpp
+#include "trie/http/tls_transport.hh"
+
+trie::client<users_api, trie::http::tls_transport> client{
+    trie::http::tls_transport{
+        trie::http::endpoint{"api.example.com", 443},
+        trie::http::tls_transport_options{
+            .verify_peer = true,          // default
+            .ca_file = {},                // empty -> system trust store
+            .server_name = "api.example.com"}}};
+```
+
+`tls_transport_options` also supports client certificates (`client_cert_file` /
+`client_key_file`) for mTLS and disables verification with `verify_peer = false`
+(tests only). The transport concept is:
 
 ```cpp
 template <class T>
@@ -322,7 +387,11 @@ count, otherwise compilation fails.
   505.
 - Single-threaded epoll loop, one coroutine per connection;
   `listener::stop()` may be called from another thread.
-- No TLS, HTTP/2, chunked request bodies, timeouts or connection limits.
+- The client transports are `socket_transport` (one connection per request),
+  `pooled_socket_transport` (keep-alive pool) and `tls_transport` (OpenSSL,
+  one connection per request).
+- No server-side TLS yet, no HTTP/2, no chunked request bodies, no server
+  timeouts or connection limits.
 - `serve(router, endpoint)` is the blocking helper; `listener` exposes
   `valid()/error_code()/port()/run()/stop()`.
 
@@ -368,6 +437,7 @@ include/trie/
   http.hh               request_view / request / response / status / method helpers
   json.hh               trie::json: nlohmann adapter, reflection conversion, schema
   error.hh              client_error
+  validation.hh         validation hooks (options/body validator/error handler)
   server.hh             server<Controllers...>: middleware chain, 404/405, dispatch
   client.hh             client<Api, Transport>: type-safe client
   trie.hh               umbrella header
@@ -381,9 +451,11 @@ include/trie/
   http/event_loop.hh    epoll event loop + task / io awaiter
   http/listener.hh      listener / connection coroutine / serve()
   http/socket_transport.hh  blocking HTTP/1.1 client transport
+  http/pooled_socket_transport.hh  keep-alive pooled client transport
+  http/tls_transport.hh     optional OpenSSL TLS client transport
   middleware/sqlite.hh  optional SQLite database/transaction/middleware
 vendor/nlohmann-json/   nlohmann/json git submodule, pinned to v3.12.0
-tests/                  13 framework-free tests (incl. real-socket integration)
+tests/                  16 framework-free tests (incl. real-socket and TLS tests)
 examples/               basic routing, HTTP server (JSON/schema/middleware),
                         SQLite notes server
 ```
@@ -397,8 +469,9 @@ include path. `trie/json.hh` defines `JSON_NOEXCEPTION` before including it.
 
 ## Current limitations
 
-- Server transport only; the client uses the transport concept (loopback and
-  blocking TCP transports are provided).
+- No server-side TLS (HTTPS listener) yet; `tls_transport` is client-side only.
+- The TLS transport does not pool connections (it opens one per request);
+  pooling is available for plain HTTP via `pooled_socket_transport`.
 - Single-threaded event loop; no TLS, HTTP/2, chunked requests, timeouts or
   connection limits.
 - Schema validation is a built-in validator, not a full JSON Schema engine;

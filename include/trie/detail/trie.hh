@@ -11,6 +11,7 @@
 
 #include "trie/detail/reflect.hh"
 #include "trie/http/context.hh"
+#include "trie/validation.hh"
 
 namespace trie::detail {
 
@@ -154,7 +155,9 @@ struct dispatch_ctx {
   std::size_t arena_used = 0;
   bool bad_request = false;
   std::string bad_request_reason{};
+  std::string_view bad_request_type{};
   http::context* request_context = nullptr;
+  const validation_hooks* validation = nullptr;
 
   std::span<char> allocate(std::size_t n) {
     if (arena_used + n > arena.size()) {
@@ -233,34 +236,47 @@ constexpr auto make_arg(dispatch_ctx& c) -> param_type_t<Fn, I> {
   } else if constexpr (kind == param_kind::body) {
     if constexpr (is_string_like<U>()) {
       return make_value<T>(c.req.body, c);
-    } else if constexpr (std::is_same_v<U, json::value>) {
-      auto parsed = json::parse(c.req.body);
-      if (!parsed) {
-        c.bad_request = true;
-        c.bad_request_reason = parsed.error().message;
-        return T{};
-      }
-      return *std::move(parsed);
     } else {
+      constexpr auto type_name_pointer =
+          std::define_static_string(std::meta::display_string_of(^^U));
+      constexpr std::string_view type_name{type_name_pointer};
+
       auto parsed = json::parse(c.req.body);
       if (!parsed) {
         c.bad_request = true;
         c.bad_request_reason = parsed.error().message;
+        c.bad_request_type = type_name;
         return T{};
       }
-      auto valid = json::validate<U>(*parsed);
-      if (!valid) {
-        c.bad_request = true;
-        c.bad_request_reason = valid.error().message;
-        return T{};
+      if constexpr (std::is_same_v<U, json::value>) {
+        return *std::move(parsed);
+      } else {
+        auto options = c.validation != nullptr ? c.validation->schema_options : json::validate_options{};
+        auto valid = json::validate<U>(*parsed, options);
+        if (!valid) {
+          c.bad_request = true;
+          c.bad_request_reason = valid.error().message;
+          c.bad_request_type = type_name;
+          return T{};
+        }
+        if (c.validation != nullptr && c.validation->body && c.request_context != nullptr) {
+          auto extra = c.validation->body(c.req, type_name, *parsed, *c.request_context);
+          if (!extra) {
+            c.bad_request = true;
+            c.bad_request_reason = extra.error();
+            c.bad_request_type = type_name;
+            return T{};
+          }
+        }
+        auto converted = json::from_json<U>(*parsed);
+        if (!converted) {
+          c.bad_request = true;
+          c.bad_request_reason = converted.error().message;
+          c.bad_request_type = type_name;
+          return T{};
+        }
+        return *std::move(converted);
       }
-      auto converted = json::from_json<U>(*parsed);
-      if (!converted) {
-        c.bad_request = true;
-        c.bad_request_reason = converted.error().message;
-        return T{};
-      }
-      return *std::move(converted);
     }
   } else {
     constexpr auto name = param_name<Fn, I>();
@@ -338,6 +354,14 @@ void invoke_args(Self& self, dispatch_ctx& c, std::index_sequence<Is...>) {
   }
   std::tuple<param_type_t<Fn, Is>...> args{make_arg<Fn, Is>(c)...};
   if (c.bad_request) {
+    if (c.validation != nullptr && c.validation->error && c.request_context != nullptr) {
+      validation_failure failure{c.bad_request_reason.empty() ? "bad request" : c.bad_request_reason,
+                                 c.bad_request_type, &c.req};
+      c.res = c.validation->error(failure, *c.request_context);
+      if (c.res.status_code == static_cast<int>(http::status::ok))
+        c.res.status_code = static_cast<int>(http::status::bad_request);
+      return;
+    }
     c.res.status_code = static_cast<int>(http::status::bad_request);
     c.res.body = c.bad_request_reason.empty() ? "bad request" : c.bad_request_reason;
     return;

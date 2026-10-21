@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
@@ -42,6 +43,11 @@ constexpr std::string_view method_name(trie::method m) {
   }
   return "";
 }
+
+struct endpoint {
+  std::string host{"127.0.0.1"};
+  std::uint16_t port{8080};
+};
 
 constexpr std::optional<trie::method> method_from_name(std::string_view name) {
   if (name == "GET") return trie::method::get;

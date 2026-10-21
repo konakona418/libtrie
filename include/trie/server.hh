@@ -11,6 +11,7 @@
 
 #include "trie/detail/trie.hh"
 #include "trie/http/context.hh"
+#include "trie/validation.hh"
 
 namespace trie {
 
@@ -56,6 +57,24 @@ public:
           return mw(context, request, next);
         });
     chain_valid_ = false;
+    return *this;
+  }
+
+  // Overrides the schema strictness used for typed JSON bodies.
+  server& set_validation_options(json::validate_options options) {
+    hooks_.schema_options = options;
+    return *this;
+  }
+
+  // Additional body validation after the built-in schema checks.
+  server& on_body_validation(body_validation_handler handler) {
+    hooks_.body = std::move(handler);
+    return *this;
+  }
+
+  // Customizes the response for parse/schema/validation failures.
+  server& on_validation_error(validation_error_handler handler) {
+    hooks_.error = std::move(handler);
     return *this;
   }
 
@@ -117,11 +136,21 @@ private:
                              0,
                              false,
                              {},
-                             &context};
+                             {},
+                             &context,
+                             &hooks_};
 
     bool matched = dispatch_method(request.m, ctx);
     if (matched) return response;
     if (ctx.bad_request) {
+      if (hooks_.error) {
+        validation_failure failure{ctx.bad_request_reason.empty() ? "bad request" : ctx.bad_request_reason,
+                                   ctx.bad_request_type, &request};
+        response = hooks_.error(failure, context);
+        if (response.status_code == static_cast<int>(http::status::ok))
+          response.status_code = static_cast<int>(http::status::bad_request);
+        return response;
+      }
       response.status_code = static_cast<int>(http::status::bad_request);
       response.body = ctx.bad_request_reason.empty() ? "bad request" : ctx.bad_request_reason;
       return response;
@@ -136,6 +165,8 @@ private:
                                0,
                                false,
                                {},
+                               {},
+                               nullptr,
                                nullptr};
     std::string allow;
     bool path_exists = false;
@@ -218,6 +249,7 @@ private:
   }
 
   std::tuple<Cs...> controllers_{};
+  validation_hooks hooks_{};
   std::vector<middleware_function> middlewares_{};
   next_t chain_{};
   bool chain_valid_ = false;
