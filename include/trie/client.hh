@@ -13,14 +13,10 @@
 #include <utility>
 
 #include "trie/detail/reflect.hh"
+#include "trie/error.hh"
 #include "trie/http.hh"
 
 namespace trie {
-
-struct client_error {
-  int status = 0;
-  std::string message{};
-};
 
 namespace detail {
 

@@ -109,6 +109,32 @@ if (value) { bool ok = (*value)["ok"].get<bool>(); }
   以及任意可反序列化聚合类型（JSON），解析失败 → 400，handler 不会被调用。
 - `parse_as<T>` 会拒绝包含 `string_view`/`const char*` 的类型（避免悬垂视图）。
 
+### Schema 校验
+
+`[[=trie::body]] T` 的 JSON body 会先经过反射生成的 schema 校验，再反序列化：
+
+- 未知字段默认拒绝（`reject_unknown = true`）；
+- 必填字段 = 没有默认成员初始化器且不是 `std::optional`（`require_all = true` 可要求全部字段）；
+- 类型、整数范围、枚举名、`std::vector` 元素、`std::array` 长度、嵌套对象路径都会检查；
+- 失败返回 `400`，响应体是带路径的错误信息，handler 不会被调用，例如：
+  `home.zip: expected integer, got string`、`points[0].y: missing required field`、
+  `unknown field 'extra'`、`favorite: unknown enumerator 'purple'`。
+
+也可以直接使用校验和 schema 生成 API：
+
+```cpp
+auto document = trie::json::parse(body);
+if (auto valid = trie::json::validate<person>(*document); !valid) {
+  // valid.error().message
+}
+
+trie::json::value description = trie::json::schema<person>();
+// {"type":"object","properties":{...},"required":[...],"additionalProperties":false}
+```
+
+`validate<T>(value, {.reject_unknown, .require_all})` 可调整严格程度；
+`schema<T>()` 输出 draft-07 风格的 object/properties/required/items/enum/minItems/maxItems。
+
 ### 类型安全客户端
 
 ```cpp
@@ -127,6 +153,19 @@ trie::client<users_api, loopback_transport> client{loopback_transport{&server}};
 auto user = client.call<^^users_api::get_user>(21);        // expected<int, client_error>
 auto person = client.call<^^users_api::bump_age>(p);       // expected<person, client_error>
 ```
+
+打真实服务端时用内置的阻塞 transport（每请求一个连接，`Connection: close`）：
+
+```cpp
+trie::client<users_api, trie::http::socket_transport> http_client{
+    trie::http::socket_transport{trie::http::endpoint{"127.0.0.1", 8080}}};
+
+auto user = http_client.call<^^users_api::get_user>(21);
+auto person = http_client.call<^^users_api::bump_age>(p);
+```
+
+`socket_transport` 支持 connect / IO 超时和响应大小上限：
+`trie::http::socket_transport_options{connect_timeout_ms, io_timeout_ms, max_response_bytes}`。
 
 - 实参必须严格对应 handler 的非 context 参数，个数/类型编译期校验。
 - query/header 注解同时驱动请求构造；路径参数自动百分号编码；JSON body/返回值自动编解码。
@@ -153,7 +192,19 @@ concept transport = requires(T& t, trie::http::request request) {
 | `[[=trie::body]] std::string_view body` | 原始请求体 |
 | `[[=trie::body]] person body` | JSON 请求体（反序列化为 `person`） |
 
-路径/query/header 支持：整型、浮点、`bool`、`std::string`、`std::string_view` 及 `std::optional<T>`。
+路径/query/header 支持：整型、浮点、`bool`、`std::string`、`std::string_view`、
+**枚举**及 `std::optional<T>`。枚举默认按枚举项标识符解析（`/colors/green`），
+找不到时回退到底层整数值；客户端会自动把枚举序列化成同样的形式：
+
+```cpp
+enum class color { red, green, blue };
+
+[[=trie::get("/colors/{c}")]] std::string color_path(color c) {
+  return std::string(trie::enum_name(c));       // "green"
+}
+```
+
+`trie::enum_name(value)` / `trie::enum_from_name<E>(name)` 也可在业务代码里使用。
 路径参数个数必须与 `{placeholder}` 个数一致，否则编译期 `static_assert`。
 
 ## 返回值规则
@@ -175,6 +226,8 @@ concept transport = requires(T& t, trie::http::request request) {
 - 单线程 epoll 事件循环，每条连接一个 coroutine；`listener::stop()` 可从其他线程调用。
   不支持 TLS、HTTP/2、chunked 请求体。
 - `serve(router, endpoint)` 是阻塞封装；`listener` 提供 `valid()/error_code()/port()/run()/stop()`。
+- 客户端侧提供 `trie::http::socket_transport`：阻塞 HTTP/1.1 client transport，
+  每请求新建连接并发送 `Connection: close`，读取 Content-Length 或 EOF，无连接池、无 TLS。
 
 ## 设计
 
@@ -213,15 +266,18 @@ include/trie/
   server.hh             server<Controllers...>：404/405 与请求分派
   client.hh             client<Api, Transport>：类型安全客户端
   trie.hh               总入口
+  error.hh              client_error
   detail/reflect.hh     反射元数据、参数分类、static_assert 校验
   detail/trie.hh        编译期 trie、静态 dispatch、参数转换
+  detail/enum.hh        枚举名表、enum_name / enum_from_name
   detail/url.hh         百分号编解码
   http/parser.hh        增量 HTTP/1.1 请求解析
   http/serializer.hh    响应序列化
   http/event_loop.hh    epoll 事件循环 + task / io awaiter
   http/listener.hh      listener / connection coroutine / serve()
+  http/socket_transport.hh  阻塞 HTTP/1.1 客户端 transport
 vendor/nlohmann/        nlohmann-json 3.12.0（MIT）
-tests/                  8 个无需第三方框架的测试（含真实 socket 集成测试）
+tests/                  11 个无需第三方框架的测试（含真实 socket 集成测试）
 examples/basic.cc       纯路由 + loopback 客户端
 examples/http_server.cc coroutine/epoll 服务端 + JSON 示例
 ```
@@ -235,8 +291,8 @@ examples/http_server.cc coroutine/epoll 服务端 + JSON 示例
 
 - 只有服务端 transport；类型安全客户端自带 transport concept（示例用 loopback）。
 - 单线程事件循环；没有 TLS / HTTP/2 / chunked 请求体 / 超时与连接数上限。
-- 没有 JSON 到 schema 的校验、没有 multipart、没有 streaming body。
-- 路径参数与 query/header 参数不支持枚举、自定义类型（JSON body 支持枚举）。
+- schema 校验是内建校验器（不是完整 JSON Schema draft 引擎）；没有 multipart、streaming body。
+- 路径参数与 query/header 参数不支持自定义类型（枚举已支持；JSON body 支持更复杂的类型）。
 - 路由模板上限 95 字符、路径 32 段、handler 参数 12 个。
 - 编译期成本随路由数增长；未使用方法和路径子树会被裁剪。实测 24 条 GET 路由约 5 s，
   28 条覆盖 7 个方法的路由约 5 s（GCC 16.2，`-O0`，包含 nlohmann-json 头文件的解析成本）。

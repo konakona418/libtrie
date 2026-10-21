@@ -26,6 +26,8 @@ struct json_api {
   [[=trie::post("/person/text")]] std::string describe([[=trie::body]] person value) {
     return value.name + ":" + std::to_string(value.age);
   }
+
+  [[=trie::get("/schema")]] trie::json::value person_schema() { return trie::json::schema<person>(); }
 };
 
 struct loopback_transport {
@@ -69,6 +71,43 @@ int main() {
         trie::http::request_view::from_target(trie::method::post, "/person", {}, "{not json");
     auto response = server.dispatch(request);
     CHECK_EQ(response.status_code, 400);
+    CHECK(!response.body.empty());
+  }
+  {
+    // Missing required member (name has no default initializer).
+    trie::http::request_view request =
+        trie::http::request_view::from_target(trie::method::post, "/person", {}, R"({"age":3})");
+    auto response = server.dispatch(request);
+    CHECK_EQ(response.status_code, 400);
+    CHECK(response.body.find("missing required field") != std::string::npos);
+  }
+  {
+    // Unknown member is rejected by the default schema validation.
+    trie::http::request_view request = trie::http::request_view::from_target(
+        trie::method::post, "/person", {}, R"({"name":"x","age":3,"extra":true})");
+    auto response = server.dispatch(request);
+    CHECK_EQ(response.status_code, 400);
+    CHECK(response.body.find("unknown field") != std::string::npos);
+  }
+  {
+    // Defaulted member (age = 0) is optional.
+    trie::http::request_view request =
+        trie::http::request_view::from_target(trie::method::post, "/person", {}, R"({"name":"x"})");
+    auto response = server.dispatch(request);
+    CHECK_EQ(response.status_code, 200);
+    auto parsed = trie::json::parse_as<person>(response.body);
+    CHECK(parsed.has_value());
+    CHECK_EQ(parsed->name, std::string{"x"});
+    CHECK_EQ(parsed->age, 0);
+  }
+  {
+    auto response = server.dispatch(trie::method::get, "/schema");
+    CHECK_EQ(response.status_code, 200);
+    auto parsed = trie::json::parse(response.body);
+    CHECK(parsed.has_value());
+    CHECK_EQ((*parsed)["type"].get<std::string>(), std::string{"object"});
+    CHECK_EQ((*parsed)["additionalProperties"].get<bool>(), false);
+    CHECK_EQ((*parsed)["required"][0].get<std::string>(), std::string{"name"});
   }
   {
     auto response = server.dispatch(trie::method::get, "/person");

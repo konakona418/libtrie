@@ -152,6 +152,7 @@ struct dispatch_ctx {
   std::array<char, 4096> arena{};
   std::size_t arena_used = 0;
   bool bad_request = false;
+  std::string bad_request_reason{};
 
   std::span<char> allocate(std::size_t n) {
     if (arena_used + n > arena.size()) {
@@ -179,6 +180,7 @@ struct dispatch_ctx {
   void reset_route_search() {
     capture_count = 0;
     bad_request = false;
+    bad_request_reason.clear();
   }
 };
 
@@ -231,16 +233,30 @@ constexpr auto make_arg(dispatch_ctx& c) -> param_type_t<Fn, I> {
       auto parsed = json::parse(c.req.body);
       if (!parsed) {
         c.bad_request = true;
+        c.bad_request_reason = parsed.error().message;
         return T{};
       }
       return *std::move(parsed);
     } else {
-      auto parsed = json::parse_as<U>(c.req.body);
+      auto parsed = json::parse(c.req.body);
       if (!parsed) {
         c.bad_request = true;
+        c.bad_request_reason = parsed.error().message;
         return T{};
       }
-      return *std::move(parsed);
+      auto valid = json::validate<U>(*parsed);
+      if (!valid) {
+        c.bad_request = true;
+        c.bad_request_reason = valid.error().message;
+        return T{};
+      }
+      auto converted = json::from_json<U>(*parsed);
+      if (!converted) {
+        c.bad_request = true;
+        c.bad_request_reason = converted.error().message;
+        return T{};
+      }
+      return *std::move(converted);
     }
   } else {
     constexpr auto name = param_name<Fn, I>();
@@ -294,7 +310,7 @@ void invoke_args(Self& self, dispatch_ctx& c, std::index_sequence<Is...>) {
   std::tuple<param_type_t<Fn, Is>...> args{make_arg<Fn, Is>(c)...};
   if (c.bad_request) {
     c.res.status_code = static_cast<int>(http::status::bad_request);
-    c.res.body = "bad request";
+    c.res.body = c.bad_request_reason.empty() ? "bad request" : c.bad_request_reason;
     return;
   }
   std::apply(

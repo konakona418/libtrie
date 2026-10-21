@@ -467,6 +467,246 @@ std::expected<T, error> from_json(value const& v) {
 }
 
 // ---------------------------------------------------------------------------
+// Schema validation
+// ---------------------------------------------------------------------------
+
+// Options for validate<T>().
+struct validate_options {
+  // Reject object keys that do not name a public non-static data member of the
+  // reflected aggregate type.
+  bool reject_unknown = true;
+  // Treat every aggregate member as required, including std::optional members
+  // and members with a default member initializer. When false (the default) a
+  // member is only required when it has no default member initializer and is
+  // not a std::optional.
+  bool require_all = false;
+};
+
+namespace detail {
+
+inline std::string join_path(std::string_view base, std::string_view key) {
+  std::string out{base};
+  if (!out.empty()) out.push_back('.');
+  out += key;
+  return out;
+}
+
+inline std::string index_path(std::string_view base, std::size_t index) {
+  std::string out{base};
+  out.push_back('[');
+  out += std::to_string(index);
+  out.push_back(']');
+  return out;
+}
+
+// Prefixes `message` with the location `path`; a root-level failure keeps the
+// bare message. Errors never carry a source offset because validation works on
+// an already parsed document.
+inline std::unexpected<error> validation_error(std::string_view path, std::string message) {
+  if (!path.empty()) {
+    message.insert(0, ": ");
+    message.insert(0, path);
+  }
+  return std::unexpected(error{0, std::move(message)});
+}
+
+// Validates `v` as a value of type T, reporting failures relative to `path`
+// (empty at the root, then "member", "member.member", "items[3]", ...).
+//
+// Scalar validation delegates to from_json(), so the accepted-value rules
+// (integral-valued floats for integers, range checks, enumerator names, ...)
+// are exactly the conversion rules exposed by the rest of this header.
+template <class T>
+std::expected<void, error> validate_impl(value const& v, validate_options options, std::string_view path) {
+  using U = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<U, value>) {
+    return {};
+  } else if constexpr (std::is_same_v<U, bool> || std::is_integral_v<U> || std::is_floating_point_v<U> ||
+                       std::is_same_v<U, std::string> || std::is_same_v<U, std::string_view> ||
+                       std::is_same_v<U, const char*>) {
+    auto converted = from_json<U>(v);
+    if (!converted) return validation_error(path, converted.error().message);
+    return {};
+  } else if constexpr (std::is_enum_v<U>) {
+    auto converted = enum_from_json<U>(v);
+    if (!converted) return validation_error(path, converted.error().message);
+    return {};
+  } else if constexpr (is_optional_v<U>) {
+    if (v.is_null()) return {};
+    using inner_type = typename is_optional<U>::value_type;
+    return validate_impl<inner_type>(v, options, path);
+  } else if constexpr (is_vector_v<U>) {
+    if (!v.is_array()) return validation_error(path, mismatch_message("array", v));
+    using element_type = typename is_vector<U>::value_type;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      auto checked = validate_impl<element_type>(v[i], options, index_path(path, i));
+      if (!checked) return checked;
+    }
+    return {};
+  } else if constexpr (is_std_array_v<U>) {
+    constexpr std::size_t size = is_std_array<U>::size;
+    if (!v.is_array()) return validation_error(path, mismatch_message("array", v));
+    if (v.size() != size)
+      return validation_error(path, std::string{"expected array of length "} + std::to_string(size) + ", got " +
+                                        std::to_string(v.size()));
+    using element_type = typename is_std_array<U>::value_type;
+    for (std::size_t i = 0; i < size; ++i) {
+      auto checked = validate_impl<element_type>(v[i], options, index_path(path, i));
+      if (!checked) return checked;
+    }
+    return {};
+  } else if constexpr (std::is_class_v<U>) {
+    if constexpr (!std::is_aggregate_v<U>) {
+      static_assert(always_false_v<U>,
+                    "validate: class types must be aggregates with public non-static data members");
+    } else {
+      if (!v.is_object()) return validation_error(path, mismatch_message("object", v));
+
+      for (auto it = v.begin(); it != v.end(); ++it) {
+        std::string_view const key = it.key();
+        bool matched = false;
+        template for (constexpr auto member : nonstatic_members<U>()) {
+          using member_type = typename [:std::meta::type_of(member):];
+          if constexpr (std::is_array_v<member_type>) {
+            static_assert(always_false_v<member_type>,
+                          "validate: raw array data members are not supported; use std::array");
+          } else {
+            if (!matched && key == std::meta::identifier_of(member)) {
+              auto checked = validate_impl<member_type>(*it, options, join_path(path, key));
+              if (!checked) return checked;
+              matched = true;
+            }
+          }
+        }
+        if (!matched && options.reject_unknown)
+          return validation_error(path, std::string{"unknown field '"} + std::string{key} + "'");
+      }
+
+      // report a missing required field, using the field path so the message
+      // points at exactly where the value is absent.
+      template for (constexpr auto member : nonstatic_members<U>()) {
+        using member_type = typename [:std::meta::type_of(member):];
+        constexpr bool naturally_required =
+            !std::meta::has_default_member_initializer(member) && !is_optional_v<member_type>;
+        std::string_view const name = std::meta::identifier_of(member);
+        if (!v.contains(name) && (options.require_all || naturally_required))
+          return validation_error(join_path(path, name), "missing required field");
+      }
+      return {};
+    }
+  } else {
+    static_assert(always_false_v<U>, "validate: type is not JSON-validatable");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Schema generation
+// ---------------------------------------------------------------------------
+
+inline value schema_type(std::string_view type) {
+  value out = value::object();
+  out["type"] = std::string{type};
+  return out;
+}
+
+// A JSON-Schema (draft-07-ish) description of T. Objects list every member
+// under "properties", forbid unknown keys via "additionalProperties": false and
+// advertise the same naturally-required members that validate<T>() enforces
+// with its default options: no default member initializer and not std::optional.
+template <class T>
+value schema_impl() {
+  using U = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<U, value>) {
+    // json::value accepts anything; the empty schema is the draft-07 spelling.
+    return value::object();
+  } else if constexpr (std::is_same_v<U, bool>) {
+    return schema_type("boolean");
+  } else if constexpr (std::is_integral_v<U>) {
+    return schema_type("integer");
+  } else if constexpr (std::is_floating_point_v<U>) {
+    return schema_type("number");
+  } else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, std::string_view> ||
+                       std::is_same_v<U, const char*>) {
+    return schema_type("string");
+  } else if constexpr (std::is_enum_v<U>) {
+    value out = schema_type("string");
+    value names = value::array();
+    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^U))) {
+      names.push_back(std::string{std::meta::identifier_of(enumerator)});
+    }
+    out["enum"] = std::move(names);
+    return out;
+  } else if constexpr (is_optional_v<U>) {
+    using inner_type = typename is_optional<U>::value_type;
+    value alternatives = value::array();
+    alternatives.push_back(schema_type("null"));
+    alternatives.push_back(schema_impl<inner_type>());
+    value out = value::object();
+    out["anyOf"] = std::move(alternatives);
+    return out;
+  } else if constexpr (is_vector_v<U>) {
+    value out = schema_type("array");
+    out["items"] = schema_impl<typename is_vector<U>::value_type>();
+    return out;
+  } else if constexpr (is_std_array_v<U>) {
+    constexpr std::size_t size = is_std_array<U>::size;
+    value out = schema_type("array");
+    out["items"] = schema_impl<typename is_std_array<U>::value_type>();
+    out["minItems"] = size;
+    out["maxItems"] = size;
+    return out;
+  } else if constexpr (std::is_class_v<U>) {
+    if constexpr (!std::is_aggregate_v<U>) {
+      static_assert(always_false_v<U>,
+                    "schema: class types must be aggregates with public non-static data members");
+    } else {
+      value properties = value::object();
+      value required = value::array();
+      template for (constexpr auto member : nonstatic_members<U>()) {
+        using member_type = typename [:std::meta::type_of(member):];
+        if constexpr (std::is_array_v<member_type>) {
+          static_assert(always_false_v<member_type>,
+                        "schema: raw array data members are not supported; use std::array");
+        } else {
+          std::string const name{std::meta::identifier_of(member)};
+          properties[name] = schema_impl<member_type>();
+          constexpr bool naturally_required =
+              !std::meta::has_default_member_initializer(member) && !is_optional_v<member_type>;
+          if (naturally_required) required.push_back(name);
+        }
+      }
+      value out = schema_type("object");
+      out["properties"] = std::move(properties);
+      out["required"] = std::move(required);
+      out["additionalProperties"] = false;
+      return out;
+    }
+  } else {
+    static_assert(always_false_v<U>, "schema: type is not JSON-serializable");
+  }
+}
+
+} // namespace detail
+
+// Validates `v` as a T without converting it. Failures are reported through
+// std::expected; their message carries the dotted/indexed path of the offending
+// value ("address.zip: expected string", "items[2].name: missing required
+// field", "color: unknown enumerator 'purple'", ...).
+template <class T>
+std::expected<void, error> validate(value const& v, validate_options options = {}) {
+  return detail::validate_impl<std::remove_cvref_t<T>>(v, options, std::string_view{});
+}
+
+// Generates a JSON-Schema-like description of T: an object schema with
+// "properties", "required" and "additionalProperties": false for aggregates,
+// "type": "array" with "items" (and "minItems"/"maxItems" for std::array), an
+// "enum" of enumerator names, and "anyOf": [null, T] for std::optional.
+template <class T>
+value schema() {
+  return detail::schema_impl<std::remove_cvref_t<T>>();
+}
+
+// ---------------------------------------------------------------------------
 // One-shot convenience
 // ---------------------------------------------------------------------------
 

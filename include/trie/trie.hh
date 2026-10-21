@@ -10,5 +10,6 @@
 #include "trie/http/listener.hh"
 #include "trie/http/parser.hh"
 #include "trie/http/serializer.hh"
+#include "trie/http/socket_transport.hh"
 #endif
 #include "trie/version.hh"

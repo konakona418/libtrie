@@ -12,6 +12,7 @@
 #include <meta>
 
 #include "trie/annotations.hh"
+#include "trie/detail/enum.hh"
 #include "trie/http.hh"
 #include "trie/json.hh"
 
@@ -169,6 +170,8 @@ consteval bool is_parseable() {
   } else if constexpr (std::is_same_v<U, bool>) {
     return true;
   } else if constexpr (std::is_integral_v<U> || std::is_floating_point_v<U>) {
+    return true;
+  } else if constexpr (std::is_enum_v<U>) {
     return true;
   } else {
     return false;
@@ -449,6 +452,14 @@ std::string value_to_text(T const& value) {
     auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
     if (ec != std::errc{}) return {};
     return std::string(buffer.data(), static_cast<std::size_t>(ptr - buffer.data()));
+  } else if constexpr (std::is_enum_v<U>) {
+    if (auto name = trie::enum_name(value); !name.empty()) return std::string(name);
+    using underlying = std::underlying_type_t<U>;
+    std::array<char, 64> buffer{};
+    auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(),
+                                  static_cast<underlying>(value));
+    if (ec != std::errc{}) return {};
+    return std::string(buffer.data(), static_cast<std::size_t>(ptr - buffer.data()));
   } else {
     static_assert(always_false_v<U>, "unsupported value type");
   }
@@ -477,6 +488,13 @@ constexpr T parse_value(std::string_view s, bool& ok) {
     auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
     ok = ec == std::errc{} && ptr == s.data() + s.size();
     return value;
+  } else if constexpr (std::is_enum_v<U>) {
+    if (auto named = trie::enum_from_name<U>(s)) return *named;
+    using underlying = std::underlying_type_t<U>;
+    underlying raw{};
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), raw);
+    ok = ec == std::errc{} && ptr == s.data() + s.size();
+    return static_cast<U>(raw);
   } else {
     static_assert(always_false_v<U>, "unsupported handler parameter type");
   }
