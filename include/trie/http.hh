@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,8 +21,37 @@ enum class status : int {
   bad_request = 400,
   not_found = 404,
   method_not_allowed = 405,
+  payload_too_large = 413,
+  uri_too_long = 414,
+  request_header_fields_too_large = 431,
   internal_server_error = 500,
+  not_implemented = 501,
+  http_version_not_supported = 505,
 };
+
+constexpr std::string_view method_name(trie::method m) {
+  switch (m) {
+    case trie::method::get: return "GET";
+    case trie::method::post: return "POST";
+    case trie::method::put: return "PUT";
+    case trie::method::patch: return "PATCH";
+    case trie::method::del: return "DELETE";
+    case trie::method::head: return "HEAD";
+    case trie::method::options: return "OPTIONS";
+  }
+  return "";
+}
+
+constexpr std::optional<trie::method> method_from_name(std::string_view name) {
+  if (name == "GET") return trie::method::get;
+  if (name == "POST") return trie::method::post;
+  if (name == "PUT") return trie::method::put;
+  if (name == "PATCH") return trie::method::patch;
+  if (name == "DELETE") return trie::method::del;
+  if (name == "HEAD") return trie::method::head;
+  if (name == "OPTIONS") return trie::method::options;
+  return std::nullopt;
+}
 
 struct header_view {
   std::string_view name;

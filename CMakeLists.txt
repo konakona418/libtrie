@@ -24,6 +24,7 @@ endif()
 
 target_include_directories(trie INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann>
     $<INSTALL_INTERFACE:include>
 )
 

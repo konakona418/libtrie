@@ -225,7 +225,23 @@ constexpr auto make_arg(dispatch_ctx& c) -> param_type_t<Fn, I> {
     constexpr std::size_t ordinal = path_ordinal<Fn, I>();
     return make_value<T>(c.captures[ordinal], c);
   } else if constexpr (kind == param_kind::body) {
-    return make_value<T>(c.req.body, c);
+    if constexpr (is_string_like<U>()) {
+      return make_value<T>(c.req.body, c);
+    } else if constexpr (std::is_same_v<U, json::value>) {
+      auto parsed = json::parse(c.req.body);
+      if (!parsed) {
+        c.bad_request = true;
+        return T{};
+      }
+      return *std::move(parsed);
+    } else {
+      auto parsed = json::parse_as<U>(c.req.body);
+      if (!parsed) {
+        c.bad_request = true;
+        return T{};
+      }
+      return *std::move(parsed);
+    }
   } else {
     constexpr auto name = param_name<Fn, I>();
     std::string_view key{name.data()};
@@ -257,8 +273,16 @@ void store_result(http::response& res, R&& value) {
     res.body.assign(value.data(), value.size());
   } else if constexpr (std::is_same_v<U, const char*>) {
     res.body = value != nullptr ? value : "";
-  } else if constexpr (std::is_integral_v<U> || std::is_floating_point_v<U> || std::is_same_v<U, bool>) {
+  } else if constexpr (std::is_same_v<U, bool>) {
+    res.body = value ? "true" : "false";
+  } else if constexpr (std::is_integral_v<U> || std::is_floating_point_v<U>) {
     res.body = value_to_text<U>(value);
+  } else if constexpr (std::is_same_v<U, json::value>) {
+    res.body = json::dump(value);
+    res.set_header("Content-Type", "application/json");
+  } else if constexpr (json::serializable<U>()) {
+    res.body = json::dump(json::to_json(value));
+    res.set_header("Content-Type", "application/json");
   } else {
     static_assert(always_false_v<U>, "unsupported handler return type");
   }
@@ -358,19 +382,6 @@ bool method_matches(dispatch_ctx& c, std::size_t depth) {
     }
   }
   return false;
-}
-
-constexpr std::string_view method_name(method m) {
-  switch (m) {
-    case method::get: return "GET";
-    case method::post: return "POST";
-    case method::put: return "PUT";
-    case method::patch: return "PATCH";
-    case method::del: return "DELETE";
-    case method::head: return "HEAD";
-    case method::options: return "OPTIONS";
-  }
-  return "";
 }
 
 } // namespace trie::detail

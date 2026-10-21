@@ -29,6 +29,16 @@ struct serialized_arg {
   bool present = true;
 };
 
+template <class T>
+consteval bool is_text_body() {
+  using U = std::remove_cvref_t<T>;
+  if constexpr (is_optional_v<U>) {
+    return is_text_body<typename is_optional<U>::value_type>();
+  } else {
+    return is_string_like<U>();
+  }
+}
+
 template <std::meta::info Fn, std::size_t J, class Arg>
 serialized_arg serialize_one(Arg&& arg) {
   constexpr std::size_t param = param_index_for_arg<Fn, J>();
@@ -36,7 +46,26 @@ serialized_arg serialize_one(Arg&& arg) {
   using U = std::remove_cvref_t<P>;
   static_assert(!std::is_reference_v<P>, "client-callable handler parameters must be values");
   P value = static_cast<P>(std::forward<Arg>(arg));
-  if constexpr (is_optional_v<U>) {
+
+  if constexpr (kind_of<Fn, param>() == param_kind::body) {
+    if constexpr (is_text_body<U>()) {
+      if constexpr (is_optional_v<U>) {
+        if (!value.has_value()) return serialized_arg{"", false};
+        return serialized_arg{value_to_text<typename is_optional<U>::value_type>(*value), true};
+      } else {
+        return serialized_arg{value_to_text<U>(value), true};
+      }
+    } else if constexpr (json::serializable<U>()) {
+      if constexpr (is_optional_v<U>) {
+        if (!value.has_value()) return serialized_arg{"", false};
+        return serialized_arg{json::dump(json::to_json(*value)), true};
+      } else {
+        return serialized_arg{json::dump(json::to_json(value)), true};
+      }
+    } else {
+      static_assert(always_false_v<U>, "unsupported JSON body argument type");
+    }
+  } else if constexpr (is_optional_v<U>) {
     if (!value.has_value()) return serialized_arg{"", false};
     return serialized_arg{value_to_text<typename is_optional<U>::value_type>(*value), true};
   } else {
@@ -108,7 +137,8 @@ void append_parameter(http::request& request, std::string& query, std::span<cons
 }
 
 template <std::meta::info Fn, std::size_t... Is>
-void append_parameters_impl(http::request& request, std::string& query, std::span<const serialized_arg> values,
+void append_parameters_impl(http::request& request, std::string& query,
+                            [[maybe_unused]] std::span<const serialized_arg> values,
                             std::index_sequence<Is...>) {
   (append_parameter<Fn, Is>(request, query, values), ...);
 }
@@ -142,11 +172,19 @@ client_result_t<R> make_client_result(std::expected<http::response, client_error
     return std::move(response.body);
   } else if constexpr (std::is_same_v<V, http::status>) {
     return static_cast<http::status>(response.status_code);
-  } else if constexpr (std::is_integral_v<V> || std::is_floating_point_v<V> || std::is_same_v<V, bool>) {
+  } else if constexpr (std::is_integral_v<V> || std::is_floating_point_v<V>) {
     bool ok = true;
     V value = parse_value<V>(response.body, ok);
     if (!ok) return std::unexpected(client_error{0, "invalid response body"});
     return value;
+  } else if constexpr (std::is_same_v<V, json::value>) {
+    auto parsed = json::parse(response.body);
+    if (!parsed) return std::unexpected(client_error{0, parsed.error().message});
+    return *std::move(parsed);
+  } else if constexpr (json::serializable<V>()) {
+    auto parsed = json::parse_as<V>(response.body);
+    if (!parsed) return std::unexpected(client_error{0, parsed.error().message});
+    return *std::move(parsed);
   } else {
     static_assert(always_false_v<V>, "unsupported client return type");
   }

@@ -73,7 +73,7 @@ public:
       if (!probe_method(m, probe)) continue;
       path_exists = true;
       if (!allow.empty()) allow += ", ";
-      allow += detail::method_name(m);
+      allow += http::method_name(m);
     }
 
     if (path_exists) {

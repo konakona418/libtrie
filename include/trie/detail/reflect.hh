@@ -13,6 +13,7 @@
 
 #include "trie/annotations.hh"
 #include "trie/http.hh"
+#include "trie/json.hh"
 
 namespace trie::detail {
 
@@ -333,8 +334,12 @@ consteval bool param_ok() {
     return false;
   } else {
     if (!d.valid) return false;
-    if constexpr (d.kind == param_kind::body) return is_string_like<U>();
-    else return is_parseable<U>();
+    if constexpr (d.kind == param_kind::body) {
+      return is_string_like<U>() ||
+             (json::serializable<U>() && !json::borrows_parsed_storage<U>());
+    } else {
+      return is_parseable<U>();
+    }
   }
 }
 
@@ -355,6 +360,8 @@ consteval bool return_ok() {
   else if constexpr (std::is_same_v<R, http::status>) return true;
   else if constexpr (is_string_like<R>()) return true;
   else if constexpr (std::is_integral_v<R> || std::is_floating_point_v<R>) return true;
+  else if constexpr (std::is_same_v<R, json::value>) return true;
+  else if constexpr (json::serializable<R>() && !json::borrows_parsed_storage<R>()) return true;
   else return false;
 }
 
