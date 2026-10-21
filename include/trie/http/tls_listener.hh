@@ -93,6 +93,10 @@ public:
 
   ~tls_listener() {
     close_connections();
+    if (listen_fd_ >= 0) {
+      ::close(listen_fd_);
+      listen_fd_ = -1;
+    }
     if (ctx_ != nullptr) {
       SSL_CTX_free(ctx_);
       ctx_ = nullptr;
