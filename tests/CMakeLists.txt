@@ -1,0 +1,12 @@
+function(trie_add_test name)
+    add_executable(${name} ${name}.cc)
+    target_link_libraries(${name} PRIVATE trie::trie)
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(${name} PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+trie_add_test(url_test)
+trie_add_test(http_test)
+trie_add_test(router_test)
+trie_add_test(client_test)
