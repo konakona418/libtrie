@@ -78,6 +78,10 @@ public:
     return *this;
   }
 
+  // Builds the middleware chain up front. Threaded listeners call this before
+  // starting worker threads so concurrent dispatches only read the chain.
+  void prepare() { ensure_chain(); }
+
   http::response dispatch(const http::request_view& request) {
     http::context context{};
     if (middlewares_.empty()) return dispatch_impl(request, context);

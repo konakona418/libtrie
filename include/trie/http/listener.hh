@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -26,6 +27,37 @@
 
 namespace trie::http {
 
+// Process-wide connection counter shared by all worker listeners. A maximum of
+// 0 means unlimited. Acquire before accepting a connection; release when the
+// connection closes.
+class connection_limiter {
+public:
+  explicit connection_limiter(std::size_t maximum) : maximum_(maximum) {}
+
+  bool acquire() {
+    if (maximum_ == 0) {
+      count_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    std::size_t current = count_.load(std::memory_order_relaxed);
+    while (current < maximum_) {
+      if (count_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                      std::memory_order_relaxed))
+        return true;
+    }
+    return false;
+  }
+
+  void release() { count_.fetch_sub(1, std::memory_order_acq_rel); }
+
+  std::size_t current() const { return count_.load(std::memory_order_relaxed); }
+  std::size_t maximum() const { return maximum_; }
+
+private:
+  std::size_t maximum_ = 0;
+  std::atomic<std::size_t> count_{0};
+};
+
 struct serve_options {
   parser_limits limits{};
   // Per-read/write wait timeout.
@@ -36,6 +68,14 @@ struct serve_options {
   std::chrono::milliseconds idle_timeout{30000};
   // How long stop() waits for in-flight requests before forcing the loop down.
   std::chrono::milliseconds drain_timeout{5000};
+  // Bind with SO_REUSEPORT so several worker listener sockets can share the port.
+  bool reuse_port = false;
+  // Maximum concurrent connections for this listener when no shared limiter is
+  // supplied (0 = unlimited).
+  std::size_t max_connections = 0;
+  // Shared limiter used by threaded listeners to enforce a global limit; when
+  // set it takes precedence over max_connections.
+  std::shared_ptr<connection_limiter> connection_limit{};
 };
 
 // Blocking epoll server: accepts connections, runs one coroutine per connection
@@ -51,6 +91,10 @@ class listener {
 public:
   listener(Router& router, endpoint address, serve_options options = {})
       : router_(router), options_(options) {
+    if (options_.connection_limit != nullptr)
+      limiter_ = options_.connection_limit;
+    else
+      limiter_ = std::make_shared<connection_limiter>(options_.max_connections);
     open_socket(std::move(address));
   }
 
@@ -82,6 +126,9 @@ public:
 
   bool stopping() const { return stopping_.load(std::memory_order_relaxed); }
 
+  // Total connections accepted by this listener (for observability/tests).
+  std::size_t accepted_connections() const { return accepted_.load(std::memory_order_relaxed); }
+
 private:
   void open_socket(endpoint address) {
     addrinfo hints{};
@@ -101,6 +148,12 @@ private:
 
       int reuse = 1;
       (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#if defined(SO_REUSEPORT)
+      if (options_.reuse_port) {
+        int reuse_port = 1;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse_port, sizeof(reuse_port));
+      }
+#endif
       if (it->ai_family == AF_INET6) {
         int only_v6 = 0;
         (void)::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &only_v6, sizeof(only_v6));
@@ -137,6 +190,17 @@ private:
       }
       int no_delay = 1;
       (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+
+      if (!limiter_->acquire()) {
+        // Best-effort 503 for the rejected connection, then close it.
+        static constexpr std::string_view too_many =
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        (void)::send(fd, too_many.data(), too_many.size(), MSG_NOSIGNAL);
+        ::close(fd);
+        continue;
+      }
+
+      accepted_.fetch_add(1, std::memory_order_relaxed);
       connections_.insert_or_assign(fd, false);
       (void)handle_connection(this, fd);
     }
@@ -179,6 +243,7 @@ private:
     auto finish = [&] {
       self->loop_.remove(fd);
       self->connections_.erase(fd);
+      self->limiter_->release();
       ::close(fd);
     };
 
@@ -293,6 +358,7 @@ private:
     for (auto const& [fd, active] : connections_) {
       (void)active;
       loop_.remove(fd);
+      limiter_->release();
       ::close(fd);
     }
     connections_.clear();
@@ -304,7 +370,9 @@ private:
   int listen_fd_ = -1;
   int error_code_ = 0;
   std::uint16_t port_ = 0;
+  std::shared_ptr<connection_limiter> limiter_{};
   std::atomic<bool> stopping_{false};
+  std::atomic<std::size_t> accepted_{0};
   bool draining_ = false;
   clock::time_point drain_deadline_{};
   std::unordered_map<int, bool> connections_{};

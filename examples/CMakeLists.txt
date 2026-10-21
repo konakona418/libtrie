@@ -14,6 +14,10 @@ add_executable(trie_05_client 05_client.cc)
 target_link_libraries(trie_05_client PRIVATE trie::trie Threads::Threads)
 target_compile_options(trie_05_client PRIVATE -fno-exceptions -fno-rtti)
 
+add_executable(trie_06_threaded 06_threaded.cc)
+target_link_libraries(trie_06_threaded PRIVATE trie::trie Threads::Threads)
+target_compile_options(trie_06_threaded PRIVATE -fno-exceptions -fno-rtti)
+
 add_executable(trie_basic basic.cc)
 target_link_libraries(trie_basic PRIVATE trie::trie)
 target_compile_options(trie_basic PRIVATE -fno-exceptions -fno-rtti)

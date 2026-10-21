@@ -12,5 +12,6 @@
 #include "trie/http/serializer.hh"
 #include "trie/http/pooled_socket_transport.hh"
 #include "trie/http/socket_transport.hh"
+#include "trie/http/threaded_listener.hh"
 #endif
 #include "trie/version.hh"

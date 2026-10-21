@@ -7,7 +7,8 @@ A C++26 reflection HTTP framework built on P2996 (reflection), P3394
   handler methods become a trie at compile time. Matching is a chain of static
   nested calls, not a runtime table lookup.
 - **HTTP/1.1 transport.** A blocking server built on C++20 coroutines + epoll
-  (one coroutine per connection, single-threaded event loop).
+  (one coroutine per connection). Single-threaded `listener` or a multi-threaded
+  `threaded_listener` with SO_REUSEPORT workers and a global connection cap.
 - **JSON.** Vendored [nlohmann/json](https://github.com/nlohmann/json) plus a
   reflection layer that converts aggregate types to/from JSON.
 - **Schema validation with hooks.** Typed request bodies are validated against a
@@ -46,7 +47,7 @@ git submodule update --init --recursive
 git submodule update --init --recursive
 cmake --preset dev
 cmake --build --preset dev
-ctest --preset dev            # 21 tests with SQLite + OpenSSL available
+ctest --preset dev            # 22 tests with SQLite + OpenSSL available
 ```
 
 Examples (small, focused, readable; run any of them without arguments):
@@ -57,6 +58,7 @@ Examples (small, focused, readable; run any of them without arguments):
 ./build/dev/examples/trie_03_json_schema           # typed JSON + schema validation hooks
 ./build/dev/examples/trie_04_middleware            # context injection, auth middleware, hooks
 ./build/dev/examples/trie_05_client                # type-safe client over a real socket
+./build/dev/examples/trie_06_threaded 8083 4      # 4 SO_REUSEPORT worker threads
 ./build/dev/examples/trie_basic                    # routing + loopback client
 ./build/dev/examples/trie_http_server 8080         # routes, JSON, schema, middleware (serves HTTP)
 ./build/dev/examples/trie_sqlite_notes 8081        # SQLite notes API with transactions
@@ -459,8 +461,13 @@ count, otherwise compilation fails.
 - The client transports are `socket_transport` (one connection per request),
   `pooled_socket_transport` (keep-alive pool) and `tls_transport` (OpenSSL,
   one connection per request).
-- No server-side TLS yet, no HTTP/2, no chunked request bodies, no connection
-  count limit / multi-threaded loops.
+- No server-side TLS yet, no HTTP/2, no chunked request bodies.
+- `threaded_listener<Router>` runs one listener socket + epoll loop per worker
+  (SO_REUSEPORT); `serve_options.max_connections` caps concurrent connections
+  across all workers (extra connections get `503 Service Unavailable`).
+- Handlers and middleware state are shared by worker threads: make handler state
+  thread-safe and configure middleware/validation hooks before constructing the
+  listener (the chain is prepared once).
 - `serve(router, endpoint)` is the blocking helper; `listener` exposes
   `valid()/error_code()/port()/run()/stop()`.
 
@@ -518,15 +525,16 @@ include/trie/
   http/serializer.hh    response serializer
   http/context.hh       request-scoped context + middleware next function
   http/event_loop.hh    epoll event loop + task / io awaiter
-  http/listener.hh      listener / connection coroutine / serve()
+  http/listener.hh      listener / connection coroutine / serve() / connection_limiter
+  http/threaded_listener.hh  SO_REUSEPORT worker threads + serve_threaded()
   http/socket_transport.hh  blocking HTTP/1.1 client transport
   http/pooled_socket_transport.hh  keep-alive pooled client transport
   http/tls_transport.hh     optional OpenSSL TLS client transport
   middleware/sqlite.hh  optional SQLite: database/statement/transaction/middleware
 vendor/nlohmann-json/   nlohmann/json git submodule, pinned to v3.12.0
-tests/                  21 framework-free tests (incl. real-socket, TLS, fuzz and timeout tests)
+tests/                  22 framework-free tests (incl. real-socket, TLS, threaded, fuzz and timeout tests)
 examples/               01_hello, 02_params, 03_json_schema, 04_middleware,
-                        05_client, basic, http_server, sqlite_notes,
+                        05_client, 06_threaded, basic, http_server, sqlite_notes,
                         chat/chat_server (SQLite-backed browser chat room)
 ```
 
@@ -542,8 +550,9 @@ include path. `trie/json.hh` defines `JSON_NOEXCEPTION` before including it.
 - No server-side TLS (HTTPS listener) yet; `tls_transport` is client-side only.
 - The TLS transport does not pool connections (it opens one per request);
   pooling is available for plain HTTP via `pooled_socket_transport`.
-- Single-threaded event loop; no server TLS, HTTP/2, chunked requests,
-  connection limits or multi-threaded worker pool.
+- No server TLS, HTTP/2 or chunked requests. Multi-threading uses one event loop
+  per worker (SO_REUSEPORT); handlers run on the accepting worker and must be
+  thread-safe. There is no separate handler thread pool.
 - Schema validation is a built-in validator, not a full JSON Schema engine;
   no multipart or streaming bodies.
 - SQLite middleware supports bound parameters but not typed row/column decoding
