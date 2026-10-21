@@ -27,7 +27,7 @@ A C++26 reflection HTTP framework built on P2996 (reflection), P3394
 - CMake ≥ 3.23 and Ninja (the `dev` preset uses Ninja).
 - **Linux** for the HTTP transport (epoll). Routing, JSON, middleware and the
   client core are platform-independent.
-- Optional: SQLite 3 development files for the SQLite middleware example/test.
+- Optional: SQLite 3 development files for the SQLite middleware examples/tests.
 - Optional: OpenSSL development files for `trie/http/tls_transport.hh` (the TLS
   client transport is an opt-in header, not part of the umbrella include).
 
@@ -46,16 +46,51 @@ git submodule update --init --recursive
 git submodule update --init --recursive
 cmake --preset dev
 cmake --build --preset dev
-ctest --preset dev            # 16 tests (TLS test when OpenSSL is found)
+ctest --preset dev            # 17 tests with SQLite + OpenSSL available
 ```
 
-Examples:
+Examples (small, focused, readable; run any of them without arguments):
 
 ```sh
-./build/dev/examples/trie_basic
-./build/dev/examples/trie_http_server 8080        # routes, JSON, schema, middleware
-./build/dev/examples/trie_sqlite_notes 8081       # SQLite transaction middleware
+./build/dev/examples/trie_01_hello                 # minimal annotated route + listener
+./build/dev/examples/trie_02_params                # path/query/header/enum params, 404/405
+./build/dev/examples/trie_03_json_schema           # typed JSON + schema validation hooks
+./build/dev/examples/trie_04_middleware            # context injection, auth middleware, hooks
+./build/dev/examples/trie_05_client                # type-safe client over a real socket
+./build/dev/examples/trie_basic                    # routing + loopback client
+./build/dev/examples/trie_http_server 8080         # routes, JSON, schema, middleware (serves HTTP)
+./build/dev/examples/trie_sqlite_notes 8081        # SQLite notes API with transactions
+./build/dev/examples/trie_chat 8082 [chat.db]      # browser chat room (see below)
 ```
+
+### Chat example
+
+`examples/chat/chat_server.cc` is a small browser chat room that exercises most
+of the framework end to end: annotated routing, typed JSON bodies, schema +
+custom validation hooks, request-scoped middleware context, SQLite transactions
+and prepared-statement binding, plus a tiny HTML/JS UI served by a handler.
+
+```sh
+./build/dev/examples/trie_chat 8082 chat.db
+# open http://127.0.0.1:8082/
+```
+
+REST API (also used by the UI):
+
+```sh
+curl http://127.0.0.1:8082/api/rooms
+curl -X POST -H 'Content-Type: application/json' -d '{"name":"random"}' \
+     http://127.0.0.1:8082/api/rooms
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"author":"alice","text":"hello"}' \
+     http://127.0.0.1:8082/api/rooms/general/messages
+curl 'http://127.0.0.1:8082/api/rooms/general/messages?after=0&limit=50'
+```
+
+Validation failures are returned as JSON (`{"error":"...","type":"..."}`) via
+`on_validation_error`; message/room length limits are enforced with
+`on_body_validation`; every request gets a SQLite transaction and a request
+counter from middleware.
 
 ## Quick start
 
@@ -181,11 +216,25 @@ int main() {
 ```
 
 `trie::sqlite::middleware` opens a transaction per request
-(`BEGIN IMMEDIATE`), injects `trie::sqlite::transaction&`, commits on
+(`BEGIN IMMEDIATE` by default), injects `trie::sqlite::transaction&`, commits on
 responses below 500 and rolls back on 5xx (or when a handler never finishes the
-transaction). `transaction` and `database` expose `exec()` / `query()` with
-`std::expected` results; rows are `std::vector<std::optional<std::string>>`.
-Parameter binding is not implemented yet.
+transaction). The module provides:
+
+- **Bound parameters** for `exec`/`query`, so user input never becomes SQL:
+  `tx.exec("INSERT INTO notes(text) VALUES(?1)", text)`,
+  `tx.query("SELECT id FROM notes WHERE author = ?1", author)`.
+  Supported bind types: integers, enums, floating point, `bool`, `std::string`,
+  `std::string_view`, `const char*`, `std::optional<T>` and `nullptr`.
+- **`statement`**: RAII prepared statement with `bind`, `reset`, `step`,
+  `current_row`, `column_count` for manual iteration; `database::prepare` and
+  `transaction::prepare` return one.
+- **`open_options`**: `busy_timeout_ms`, `enable_wal`, `foreign_keys`
+  (`db.open(path, {.enable_wal = true})`).
+- **Transaction modes**: `transaction_mode::deferred/immediate/exclusive`
+  (`transaction{handle, transaction_mode::deferred}` and
+  `middleware{&db, transaction_mode::deferred}`).
+- `last_insert_rowid()` / `changes()` on `database`, `transaction` and
+  `statement`, plus `std::expected` errors everywhere.
 
 ### JSON
 
@@ -453,11 +502,12 @@ include/trie/
   http/socket_transport.hh  blocking HTTP/1.1 client transport
   http/pooled_socket_transport.hh  keep-alive pooled client transport
   http/tls_transport.hh     optional OpenSSL TLS client transport
-  middleware/sqlite.hh  optional SQLite database/transaction/middleware
+  middleware/sqlite.hh  optional SQLite: database/statement/transaction/middleware
 vendor/nlohmann-json/   nlohmann/json git submodule, pinned to v3.12.0
 tests/                  16 framework-free tests (incl. real-socket and TLS tests)
-examples/               basic routing, HTTP server (JSON/schema/middleware),
-                        SQLite notes server
+examples/               01_hello, 02_params, 03_json_schema, 04_middleware,
+                        05_client, basic, http_server, sqlite_notes,
+                        chat/chat_server (SQLite-backed browser chat room)
 ```
 
 ## Third-party
@@ -476,7 +526,8 @@ include path. `trie/json.hh` defines `JSON_NOEXCEPTION` before including it.
   connection limits.
 - Schema validation is a built-in validator, not a full JSON Schema engine;
   no multipart or streaming bodies.
-- SQLite middleware has no prepared-statement binding (raw `exec`/`query` only).
+- SQLite middleware supports bound parameters but not typed row/column decoding
+  (rows are optional strings) or migrations.
 - Path/query/header parameters do not support arbitrary user-defined types
   (enums are supported; JSON bodies support much richer types).
 - Route templates are limited to 95 characters, 32 path segments and 12 handler

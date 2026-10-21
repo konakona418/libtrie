@@ -23,6 +23,7 @@ enum class status : int {
   unauthorized = 401,
   not_found = 404,
   method_not_allowed = 405,
+  conflict = 409,
   payload_too_large = 413,
   uri_too_long = 414,
   request_header_fields_too_large = 431,

@@ -238,7 +238,7 @@ constexpr auto make_arg(dispatch_ctx& c) -> param_type_t<Fn, I> {
       return make_value<T>(c.req.body, c);
     } else {
       constexpr auto type_name_pointer =
-          std::define_static_string(std::meta::display_string_of(^^U));
+          std::define_static_string(std::meta::display_string_of(std::meta::dealias(^^U)));
       constexpr std::string_view type_name{type_name_pointer};
 
       auto parsed = json::parse(c.req.body);

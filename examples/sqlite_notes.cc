@@ -11,22 +11,11 @@ struct note_input {
   std::string text;
 };
 
-// Minimal quoting helper for the demo. Parameter binding is not implemented by
-// trie::sqlite yet, so a real application should not paste unescaped input.
-std::string quote(std::string_view text) {
-  std::string out = "'";
-  for (char c : text) {
-    if (c == '\'') out += '\'';
-    out += c;
-  }
-  out += '\'';
-  return out;
-}
-
 struct notes_api {
   [[=trie::post("/notes")]] trie::json::value add_note(
       [[=trie::inject]] trie::sqlite::transaction& tx, [[=trie::body]] note_input input) {
-    auto inserted = tx.exec("INSERT INTO notes(text) VALUES(" + quote(input.text) + ")");
+    // Prepared-statement binding: user input never becomes SQL syntax.
+    auto inserted = tx.exec("INSERT INTO notes(text) VALUES(?1)", input.text);
     if (!inserted) return trie::json::value{{"error", inserted.error()}};
     trie::json::value result = trie::json::value::object();
     result["ok"] = true;
