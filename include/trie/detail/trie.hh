@@ -105,6 +105,46 @@ consteval auto build_tree() {
     nodes[parent].handlers[static_cast<std::size_t>(routes[ri].m)] = static_cast<int>(ri);
   }
 
+  // Dispatch scans the node array in order and tries matching children. Static
+  // segments must be preferred over wildcards regardless of declaration order,
+  // so reorder the used nodes by (parent, static-before-wildcard) and remap
+  // parent/self indices.
+  {
+    std::array<int, capacity> order{};
+    for (std::size_t i = 0; i < used; ++i) order[i] = static_cast<int>(i);
+    for (std::size_t i = 1; i < used; ++i) {
+      int const key = order[i];
+      int const key_parent = nodes[static_cast<std::size_t>(key)].parent;
+      bool const key_wildcard = nodes[static_cast<std::size_t>(key)].wildcard;
+      std::size_t j = i;
+      while (j > 0) {
+        int const previous = order[j - 1];
+        int const previous_parent = nodes[static_cast<std::size_t>(previous)].parent;
+        bool const previous_wildcard = nodes[static_cast<std::size_t>(previous)].wildcard;
+        bool const key_before_previous =
+            key_parent < previous_parent ||
+            (key_parent == previous_parent && !key_wildcard && previous_wildcard);
+        if (!key_before_previous) break;
+        order[j] = order[j - 1];
+        --j;
+      }
+      order[j] = key;
+    }
+
+    std::array<int, capacity> remapped{};
+    for (std::size_t i = 0; i < used; ++i) remapped[static_cast<std::size_t>(order[i])] = static_cast<int>(i);
+
+    std::array<node, capacity> sorted{};
+    for (std::size_t i = 0; i < used; ++i) {
+      node current = nodes[static_cast<std::size_t>(order[i])];
+      int const old_parent = current.parent;
+      current.self = static_cast<int>(i);
+      current.parent = old_parent < 0 ? -1 : remapped[static_cast<std::size_t>(old_parent)];
+      sorted[i] = current;
+    }
+    nodes = sorted;
+  }
+
   // Propagate "which methods are reachable in this subtree" towards the root so
   // dispatch can skip whole subtrees at compile time for other methods.
   for (std::size_t i = used; i-- > 0;) {
@@ -170,11 +210,16 @@ struct dispatch_ctx {
   }
 
   // Percent-decodes into the request arena so the returned view stays valid for
-  // the duration of the handler call.
-  std::string_view decode(std::string_view input) {
+  // the duration of the handler call. Query values use form semantics ('+' is a
+  // space); path segments and headers keep literal '+'.
+  std::string_view decode(std::string_view input) { return decode_impl(input, true); }
+
+  std::string_view decode_component(std::string_view input) { return decode_impl(input, false); }
+
+  std::string_view decode_impl(std::string_view input, bool plus_as_space) {
     auto buffer = allocate(input.size());
     if (buffer.size() != input.size()) return {};
-    auto written = url_decode(input, buffer);
+    auto written = url_decode_impl(input, buffer, plus_as_space);
     if (written == std::string_view::npos) {
       bad_request = true;
       return {};
@@ -290,7 +335,7 @@ constexpr auto make_arg(dispatch_ctx& c) -> param_type_t<Fn, I> {
     }
     std::string_view raw =
         kind == param_kind::query ? c.req.query_param(key) : c.req.header(key);
-    return make_value<T>(c.decode(raw), c);
+    return make_value<T>(kind == param_kind::query ? c.decode(raw) : c.decode_component(raw), c);
   }
 }
 
@@ -415,7 +460,7 @@ bool dispatch(Controllers& controllers, dispatch_ctx& c, std::size_t depth) {
         if (depth >= c.segments.size()) continue;
         if constexpr (n.wildcard) {
           auto saved = c.capture_count;
-          c.captures[c.capture_count++] = c.decode(c.segments[depth]);
+          c.captures[c.capture_count++] = c.decode_component(c.segments[depth]);
           if (c.bad_request) return false;
           if (dispatch<M, Controllers, Tree, n.self>(controllers, c, depth + 1)) return true;
           c.capture_count = saved;

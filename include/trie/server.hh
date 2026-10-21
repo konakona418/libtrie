@@ -102,6 +102,11 @@ public:
 private:
   static constexpr std::size_t max_path_segments = 32;
 
+  // Canonical order used both for probing and for building `Allow` values.
+  // HEAD follows GET because a HEAD route is implied by its GET route.
+  static constexpr std::array<method, method_count> allow_order{
+      method::get, method::head, method::post, method::put, method::patch, method::del, method::options};
+
   static bool split_path(std::string_view path, std::array<std::string_view, max_path_segments>& out,
                          std::size_t& count) {
     count = 0;
@@ -127,7 +132,12 @@ private:
       return response;
     }
 
-    detail::dispatch_ctx ctx{request,
+    // HEAD is GET without the response body. When no explicit HEAD route
+    // matches, route through the GET handler instead; the listener's serializer
+    // knows to suppress the body (and to keep the GET Content-Length). Handlers
+    // therefore observe the request as a GET.
+    http::request_view routed = request;
+    detail::dispatch_ctx ctx{routed,
                              response,
                              std::span<const std::string_view>{segments}.first(segment_count),
                              {},
@@ -140,12 +150,17 @@ private:
                              &context,
                              &hooks_};
 
-    bool matched = dispatch_method(request.m, ctx);
+    bool matched = dispatch_method(routed.m, ctx);
+    if (!matched && routed.m == method::head && !ctx.bad_request) {
+      ctx.reset_route_search();
+      routed.m = method::get;
+      matched = dispatch_as<method::get>(ctx);
+    }
     if (matched) return response;
     if (ctx.bad_request) {
       if (hooks_.error) {
         validation_failure failure{ctx.bad_request_reason.empty() ? "bad request" : ctx.bad_request_reason,
-                                   ctx.bad_request_type, &request};
+                                   ctx.bad_request_type, &routed};
         response = hooks_.error(failure, context);
         if (response.status_code == static_cast<int>(http::status::ok))
           response.status_code = static_cast<int>(http::status::bad_request);
@@ -156,7 +171,7 @@ private:
       return response;
     }
 
-    detail::dispatch_ctx probe{request,
+    detail::dispatch_ctx probe{routed,
                                response,
                                ctx.segments,
                                {},
@@ -168,24 +183,41 @@ private:
                                {},
                                nullptr,
                                nullptr};
-    std::string allow;
+    std::array<bool, method_count> available{};
+    for (method m : allow_order)
+      if (probe_method(m, probe)) available[static_cast<std::size_t>(m)] = true;
+
+    // A GET route can always answer HEAD, so advertise HEAD whenever GET is
+    // registered (and never list it twice).
+    if (available[static_cast<std::size_t>(method::get)])
+      available[static_cast<std::size_t>(method::head)] = true;
+
     bool path_exists = false;
-    static constexpr std::array<method, method_count> all_methods{
-        method::get, method::post, method::put, method::patch, method::del, method::head, method::options};
-    for (method m : all_methods) {
-      if (!probe_method(m, probe)) continue;
-      path_exists = true;
+    for (bool present : available) path_exists = path_exists || present;
+
+    if (!path_exists) {
+      response.status_code = static_cast<int>(http::status::not_found);
+      response.body = "not found";
+      return response;
+    }
+
+    std::string allow;
+    for (method m : allow_order) {
+      if (!available[static_cast<std::size_t>(m)]) continue;
       if (!allow.empty()) allow += ", ";
       allow += http::method_name(m);
     }
 
-    if (path_exists) {
-      response.status_code = static_cast<int>(http::status::method_not_allowed);
+    // No OPTIONS route matched but the path exists: answer the capability query
+    // automatically. Explicit OPTIONS routes take priority (handled above).
+    if (routed.m == method::options) {
+      response.status_code = static_cast<int>(http::status::no_content);
       response.set_header("Allow", std::move(allow));
-    } else {
-      response.status_code = static_cast<int>(http::status::not_found);
-      response.body = "not found";
+      return response;
     }
+
+    response.status_code = static_cast<int>(http::status::method_not_allowed);
+    response.set_header("Allow", std::move(allow));
     return response;
   }
 

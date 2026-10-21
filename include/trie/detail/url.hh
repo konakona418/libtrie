@@ -19,13 +19,16 @@ constexpr int hex_value(unsigned char c) {
   return -1;
 }
 
-// Percent-decodes `src` into `dst`. Returns the number of bytes written, or
-// `npos` when `dst` is too small or the encoding is malformed.
-inline std::size_t url_decode(std::string_view src, std::span<char> dst) {
+// Percent-decodes `src` into `dst`. `plus_as_space` implements the
+// application/x-www-form-urlencoded rule for query values; path segments and
+// header values must keep literal '+' characters.
+// Returns the number of bytes written, or `npos` when `dst` is too small or the
+// encoding is malformed.
+inline std::size_t url_decode_impl(std::string_view src, std::span<char> dst, bool plus_as_space) {
   std::size_t out = 0;
   for (std::size_t i = 0; i < src.size(); ++i) {
     unsigned char c = static_cast<unsigned char>(src[i]);
-    if (c == '+') {
+    if (c == '+' && plus_as_space) {
       if (out >= dst.size()) return std::string_view::npos;
       dst[out++] = ' ';
     } else if (c == '%') {
@@ -42,6 +45,15 @@ inline std::size_t url_decode(std::string_view src, std::span<char> dst) {
     }
   }
   return out;
+}
+
+inline std::size_t url_decode(std::string_view src, std::span<char> dst) {
+  return url_decode_impl(src, dst, true);
+}
+
+// Path segments and header values: '+' is a literal plus.
+inline std::size_t url_decode_component(std::string_view src, std::span<char> dst) {
+  return url_decode_impl(src, dst, false);
 }
 
 inline std::string url_encode(std::string_view src) {

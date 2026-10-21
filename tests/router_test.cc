@@ -124,7 +124,7 @@ int main() {
   {
     auto response = srv.dispatch(trie::method::post, "/users/42");
     CHECK_EQ(response.status_code, 405);
-    CHECK_EQ(response.header("allow"), std::string_view{"GET"});
+    CHECK_EQ(response.header("allow"), std::string_view{"GET, HEAD"});
   }
   {
     auto response = srv.dispatch(trie::method::get, "/does/not/exist");

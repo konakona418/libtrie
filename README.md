@@ -46,7 +46,7 @@ git submodule update --init --recursive
 git submodule update --init --recursive
 cmake --preset dev
 cmake --build --preset dev
-ctest --preset dev            # 17 tests with SQLite + OpenSSL available
+ctest --preset dev            # 21 tests with SQLite + OpenSSL available
 ```
 
 Examples (small, focused, readable; run any of them without arguments):
@@ -140,7 +140,8 @@ thread.join();
 
 Multiple controllers are composed as template arguments:
 `trie::server<users_api, admin_api>`. Registering the same `(method, path)`
-twice is a compile error.
+twice is a compile error. Static segments always take precedence over
+`{placeholder}` wildcards, independent of declaration order.
 
 ### Middleware and request context
 
@@ -409,7 +410,9 @@ concept transport = requires(T& t, trie::http::request request) {
 | `[[=trie::inject]] app_state& state` | request-scoped context value from middleware |
 
 Path/query/header value types: integers, floats, `bool`, `std::string`,
-`std::string_view`, enums and `std::optional<T>`. Enums parse from enumerator
+`std::string_view`, enums and `std::optional<T>`. Percent-decoding follows the
+component rules: path segments and header values keep a literal `+`, while query
+values use form semantics (`+` means space). Enums parse from enumerator
 identifiers (e.g. `/colors/green`) with a numeric fallback; the client serializes
 the same way. `trie::enum_name(value)` / `trie::enum_from_name<E>(name)` are
 public helpers. Path placeholder count must match the handler's path parameter
@@ -428,19 +431,36 @@ count, otherwise compilation fails.
 
 ## HTTP transport
 
-- HTTP/1.1: keep-alive, pipelining (sequential), HEAD (headers only),
-  `Content-Length`.
+- HTTP/1.1: keep-alive, pipelining (sequential), `Content-Length`.
+- `HEAD` falls back to the `GET` handler (body suppressed, `Content-Length` kept);
+  `OPTIONS` is answered automatically with `204` + `Allow` when no explicit
+  `OPTIONS` route exists. `Allow` includes the implied `HEAD` for `GET` routes.
+- Request timeouts are configurable per listener (`serve_options`):
+  `io_timeout` (single read/write), `request_timeout` (headers+body deadline),
+  `idle_timeout` (keep-alive), `drain_timeout` (shutdown). A partially received
+  request gets `408 Request Timeout`.
+- `listener::stop()` is non-blocking: it stops accepting, closes idle
+  connections, lets in-flight requests finish (`drain_timeout`), and then
+  `run()` returns. Safe to call from another thread.
+- Response headers are validated on serialization: CR/LF/NUL in values and
+  non-token names are dropped (header-injection defense).
 - Request limits: 16 KiB headers, 1 MiB body, 8 KiB target; at most 32 path
   segments; 24 bytes per segment.
-- Status handling: 404, 405 (with `Allow`), 400, 401, 413, 414, 431, 500, 501,
-  505.
+- Parser hardening: bare CR/LF and NUL bytes in the request line/headers/target
+  are rejected with 400, `Transfer-Encoding` (including obsolete `identity`)
+  and duplicate non-identical `Content-Length` values are rejected, and the
+  request line follows a strict method/target/version grammar. Covered by fuzz
+  and request-smuggling tests (thousands of payloads, millions of prefix
+  parses).
+- Status handling: 400, 401, 403, 404, 405 (`Allow`), 408, 409, 413, 414, 422,
+  429, 431, 500, 501, 502, 503, 504, 505, all with reason phrases.
 - Single-threaded epoll loop, one coroutine per connection;
   `listener::stop()` may be called from another thread.
 - The client transports are `socket_transport` (one connection per request),
   `pooled_socket_transport` (keep-alive pool) and `tls_transport` (OpenSSL,
   one connection per request).
-- No server-side TLS yet, no HTTP/2, no chunked request bodies, no server
-  timeouts or connection limits.
+- No server-side TLS yet, no HTTP/2, no chunked request bodies, no connection
+  count limit / multi-threaded loops.
 - `serve(router, endpoint)` is the blocking helper; `listener` exposes
   `valid()/error_code()/port()/run()/stop()`.
 
@@ -504,7 +524,7 @@ include/trie/
   http/tls_transport.hh     optional OpenSSL TLS client transport
   middleware/sqlite.hh  optional SQLite: database/statement/transaction/middleware
 vendor/nlohmann-json/   nlohmann/json git submodule, pinned to v3.12.0
-tests/                  16 framework-free tests (incl. real-socket and TLS tests)
+tests/                  21 framework-free tests (incl. real-socket, TLS, fuzz and timeout tests)
 examples/               01_hello, 02_params, 03_json_schema, 04_middleware,
                         05_client, basic, http_server, sqlite_notes,
                         chat/chat_server (SQLite-backed browser chat room)
@@ -522,8 +542,8 @@ include path. `trie/json.hh` defines `JSON_NOEXCEPTION` before including it.
 - No server-side TLS (HTTPS listener) yet; `tls_transport` is client-side only.
 - The TLS transport does not pool connections (it opens one per request);
   pooling is available for plain HTTP via `pooled_socket_transport`.
-- Single-threaded event loop; no TLS, HTTP/2, chunked requests, timeouts or
-  connection limits.
+- Single-threaded event loop; no server TLS, HTTP/2, chunked requests,
+  connection limits or multi-threaded worker pool.
 - Schema validation is a built-in validator, not a full JSON Schema engine;
   no multipart or streaming bodies.
 - SQLite middleware supports bound parameters but not typed row/column decoding

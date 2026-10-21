@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -13,7 +16,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <unordered_set>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "trie/http/event_loop.hh"
@@ -24,11 +28,24 @@ namespace trie::http {
 
 struct serve_options {
   parser_limits limits{};
+  // Per-read/write wait timeout.
+  std::chrono::milliseconds io_timeout{10000};
+  // Absolute time budget for receiving one complete request (headers + body).
+  std::chrono::milliseconds request_timeout{15000};
+  // How long a keep-alive connection may stay idle between requests.
+  std::chrono::milliseconds idle_timeout{30000};
+  // How long stop() waits for in-flight requests before forcing the loop down.
+  std::chrono::milliseconds drain_timeout{5000};
 };
 
 // Blocking epoll server: accepts connections, runs one coroutine per connection
 // (requests on a connection are handled sequentially, HTTP/1.1 keep-alive), and
 // forwards parsed requests to the compile-time router.
+//
+// stop() is non-blocking and can be called from another thread: it stops
+// accepting, closes idle keep-alive connections, waits up to drain_timeout for
+// in-flight requests, then shuts the loop down. `run()` returns when draining
+// finishes.
 template <class Router>
 class listener {
 public:
@@ -37,10 +54,7 @@ public:
     open_socket(std::move(address));
   }
 
-  ~listener() {
-    close_connections();
-    if (listen_fd_ >= 0) ::close(listen_fd_);
-  }
+  ~listener() { close_connections(); }
 
   listener(listener const&) = delete;
   listener& operator=(listener const&) = delete;
@@ -55,10 +69,18 @@ public:
   void run() {
     if (!valid()) return;
     if (!loop_.add_permanent(listen_fd_, [this] { accept_ready(); })) return;
-    loop_.run();
+    loop_.run([this] { return should_exit(); });
+    close_connections();
   }
 
-  void stop() { loop_.stop(); }
+  // Non-blocking: sets the stopping flag and wakes the run loop. The loop drains
+  // existing connections (up to drain_timeout) and then `run()` returns.
+  void stop() {
+    stopping_.store(true, std::memory_order_relaxed);
+    loop_.wake();
+  }
+
+  bool stopping() const { return stopping_.load(std::memory_order_relaxed); }
 
 private:
   void open_socket(endpoint address) {
@@ -106,6 +128,7 @@ private:
   }
 
   void accept_ready() {
+    if (stopping_.load(std::memory_order_relaxed)) return;
     while (true) {
       int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
       if (fd < 0) {
@@ -114,9 +137,33 @@ private:
       }
       int no_delay = 1;
       (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-      connections_.insert(fd);
+      connections_.insert_or_assign(fd, false);
       (void)handle_connection(this, fd);
     }
+  }
+
+  // Called on the run thread: stop accepting, close idle connections, wait for
+  // in-flight requests until drain_timeout expires.
+  bool should_exit() {
+    if (!stopping_.load(std::memory_order_relaxed)) return false;
+
+    if (!draining_) {
+      draining_ = true;
+      if (listen_fd_ >= 0) {
+        loop_.remove(listen_fd_);
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+      }
+      drain_deadline_ = clock::now() + options_.drain_timeout;
+    }
+
+    std::vector<int> idle{};
+    for (auto const& [fd, active] : connections_)
+      if (!active) idle.push_back(fd);
+    for (int fd : idle) loop_.cancel_wait(fd);
+
+    if (connections_.empty()) return true;
+    return clock::now() >= drain_deadline_;
   }
 
   static response error_response(int status_code, std::string message) {
@@ -136,14 +183,38 @@ private:
     };
 
     request_parser parser{self->options_.limits};
-    bool keep_alive = true;
-    while (keep_alive) {
+    serve_options const& options = self->options_;
+
+    while (true) {
       parsed_request request{};
       parse_error error{};
       std::size_t consumed = 0;
       parse_status status = parser.parse(buffer, request, error, consumed);
 
+      bool timed_out = false;
+      clock::time_point request_deadline = clock::time_point::max();
       while (status == parse_status::incomplete) {
+        std::chrono::milliseconds wait{0};
+        if (buffer.empty()) {
+          wait = options.idle_timeout;
+        } else {
+          clock::time_point const now = clock::now();
+          if (request_deadline == clock::time_point::max()) request_deadline = now + options.request_timeout;
+          auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(request_deadline - now);
+          if (remaining.count() <= 0) {
+            timed_out = true;
+            break;
+          }
+          wait = std::min(options.io_timeout, remaining);
+        }
+
+        io_event read_event{fd, EPOLLIN, wait};
+        bool ready = co_await read_event;
+        if (!ready) {
+          timed_out = true;
+          break;
+        }
+
         std::array<char, 8192> chunk{};
         auto received = ::recv(fd, chunk.data(), chunk.size(), 0);
         if (received == 0) {
@@ -151,11 +222,7 @@ private:
           co_return;
         }
         if (received < 0) {
-          if (errno == EINTR) continue;
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            co_await io_event{fd, EPOLLIN};
-            continue;
-          }
+          if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
           finish();
           co_return;
         }
@@ -163,11 +230,22 @@ private:
         status = parser.parse(buffer, request, error, consumed);
       }
 
+      // Idle timeout: close silently. Request timeout or parse error: error reply.
+      if (timed_out && buffer.empty()) {
+        finish();
+        co_return;
+      }
+
       std::string out;
-      if (status == parse_status::error) {
-        out = serialize_response(error_response(error.status, std::move(error.message)), false, false);
-        keep_alive = false;
+      bool close_after = false;
+      if (timed_out || status == parse_status::error) {
+        int const code = timed_out ? static_cast<int>(status::request_timeout) : error.status;
+        std::string message = timed_out ? "request timeout" : std::move(error.message);
+        out = serialize_response(error_response(code, std::move(message)), false, false);
+        close_after = true;
       } else {
+        self->connections_.insert_or_assign(fd, true);
+
         std::vector<header_view> header_views;
         header_views.reserve(request.headers.size());
         for (auto const& header : request.headers)
@@ -175,14 +253,14 @@ private:
 
         auto view = request_view::from_target(request.m, request.target, header_views, request.body);
         response result = self->router_.dispatch(view);
-        bool head_only = request.m == method::head;
+        bool const head_only = request.m == method::head;
         out = serialize_response(result, request.keep_alive, head_only);
-        keep_alive = request.keep_alive;
+        close_after = !request.keep_alive;
         buffer.erase(0, consumed);
       }
 
       std::string_view pending{out};
-      bool failed = false;
+      bool write_failed = false;
       while (!pending.empty()) {
         auto sent = ::send(fd, pending.data(), pending.size(), MSG_NOSIGNAL);
         if (sent > 0) {
@@ -191,21 +269,29 @@ private:
         }
         if (sent < 0 && errno == EINTR) continue;
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-          co_await io_event{fd, EPOLLOUT};
+          io_event write_event{fd, EPOLLOUT, options.io_timeout};
+          bool ready = co_await write_event;
+          if (!ready) {
+            write_failed = true;
+            break;
+          }
           continue;
         }
-        failed = true;
+        write_failed = true;
         break;
       }
-      if (failed || !keep_alive) break;
-    }
 
-    finish();
-    co_return;
+      if (write_failed || close_after) {
+        finish();
+        co_return;
+      }
+      self->connections_.insert_or_assign(fd, false);
+    }
   }
 
   void close_connections() {
-    for (int fd : connections_) {
+    for (auto const& [fd, active] : connections_) {
+      (void)active;
       loop_.remove(fd);
       ::close(fd);
     }
@@ -218,7 +304,10 @@ private:
   int listen_fd_ = -1;
   int error_code_ = 0;
   std::uint16_t port_ = 0;
-  std::unordered_set<int> connections_{};
+  std::atomic<bool> stopping_{false};
+  bool draining_ = false;
+  clock::time_point drain_deadline_{};
+  std::unordered_map<int, bool> connections_{};
 };
 
 template <class Router>
