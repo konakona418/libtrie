@@ -18,6 +18,14 @@ add_executable(trie_06_threaded 06_threaded.cc)
 target_link_libraries(trie_06_threaded PRIVATE trie::trie Threads::Threads)
 target_compile_options(trie_06_threaded PRIVATE -fno-exceptions -fno-rtti)
 
+# HTTPS server example requires OpenSSL.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    add_executable(trie_07_https 07_https.cc)
+    target_link_libraries(trie_07_https PRIVATE trie::trie OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    target_compile_options(trie_07_https PRIVATE -fno-exceptions -fno-rtti)
+endif()
+
 add_executable(trie_basic basic.cc)
 target_link_libraries(trie_basic PRIVATE trie::trie)
 target_compile_options(trie_basic PRIVATE -fno-exceptions -fno-rtti)

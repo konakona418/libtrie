@@ -9,6 +9,10 @@ A C++26 reflection HTTP framework built on P2996 (reflection), P3394
 - **HTTP/1.1 transport.** A blocking server built on C++20 coroutines + epoll
   (one coroutine per connection). Single-threaded `listener` or a multi-threaded
   `threaded_listener` with SO_REUSEPORT workers and a global connection cap.
+- **HTTPS and HTTP/2.** `tls_listener` adds nonblocking OpenSSL TLS (ALPN,
+  optional mTLS). With `TRIE_TLS_LISTENER_WITH_HTTP2` and nghttp2 it negotiates
+  `h2` via ALPN and serves HTTP/2 (multiplexed streams, flow control, keep-alive)
+  alongside HTTP/1.1 fallback.
 - **JSON.** Vendored [nlohmann/json](https://github.com/nlohmann/json) plus a
   reflection layer that converts aggregate types to/from JSON.
 - **Schema validation with hooks.** Typed request bodies are validated against a
@@ -29,8 +33,12 @@ A C++26 reflection HTTP framework built on P2996 (reflection), P3394
 - **Linux** for the HTTP transport (epoll). Routing, JSON, middleware and the
   client core are platform-independent.
 - Optional: SQLite 3 development files for the SQLite middleware examples/tests.
-- Optional: OpenSSL development files for `trie/http/tls_transport.hh` (the TLS
-  client transport is an opt-in header, not part of the umbrella include).
+- Optional: OpenSSL development files for the TLS client transport
+  (`trie/http/tls_transport.hh`) and HTTPS listener
+  (`trie/http/tls_listener.hh`); both are opt-in headers outside the umbrella
+  include.
+- Optional: nghttp2 development files for HTTP/2
+  (`trie/http/h2.hh` and `tls_listener` with `TRIE_TLS_LISTENER_WITH_HTTP2`).
 
 Stock Clang does not implement P2996 yet; clangd cannot parse `^^`/`[[=...]]`
 either, so expect editor false positives. The build is the source of truth.
@@ -47,7 +55,7 @@ git submodule update --init --recursive
 git submodule update --init --recursive
 cmake --preset dev
 cmake --build --preset dev
-ctest --preset dev            # 22 tests with SQLite + OpenSSL available
+ctest --preset dev            # 25 tests with SQLite + OpenSSL + nghttp2 available
 ```
 
 Examples (small, focused, readable; run any of them without arguments):
@@ -59,6 +67,7 @@ Examples (small, focused, readable; run any of them without arguments):
 ./build/dev/examples/trie_04_middleware            # context injection, auth middleware, hooks
 ./build/dev/examples/trie_05_client                # type-safe client over a real socket
 ./build/dev/examples/trie_06_threaded 8083 4      # 4 SO_REUSEPORT worker threads
+./build/dev/examples/trie_07_https 8443 tests/data/server.crt tests/data/server.key  # HTTPS
 ./build/dev/examples/trie_basic                    # routing + loopback client
 ./build/dev/examples/trie_http_server 8080         # routes, JSON, schema, middleware (serves HTTP)
 ./build/dev/examples/trie_sqlite_notes 8081        # SQLite notes API with transactions
@@ -461,15 +470,49 @@ count, otherwise compilation fails.
 - The client transports are `socket_transport` (one connection per request),
   `pooled_socket_transport` (keep-alive pool) and `tls_transport` (OpenSSL,
   one connection per request).
-- No server-side TLS yet, no HTTP/2, no chunked request bodies.
+- `tls_listener<Router>` (HTTPS) uses OpenSSL nonblocking I/O on the same
+  coroutine/epoll loop, with ALPN, optional client certificates (mTLS),
+  handshake/io/request/idle timeouts and the same graceful drain as `listener`.
+  Bad certificate/key/CA configuration reports `valid() == false`.
+- HTTP/2: with nghttp2 and `#define TRIE_TLS_LISTENER_WITH_HTTP2 1` before
+  including `trie/http/tls_listener.hh`, set
+  `tls_serve_options::enable_http2 = true` (ALPN then offers `h2` first) and link
+  `-lnghttp2`. The transport-agnostic `trie::http::h2_connection<Router>` engine
+  can also be driven over any byte stream. HTTP/2 is TLS-only here (no h2c
+  upgrade/prior knowledge); server push, trailers and priority trees are not
+  implemented.
 - `threaded_listener<Router>` runs one listener socket + epoll loop per worker
   (SO_REUSEPORT); `serve_options.max_connections` caps concurrent connections
   across all workers (extra connections get `503 Service Unavailable`).
 - Handlers and middleware state are shared by worker threads: make handler state
   thread-safe and configure middleware/validation hooks before constructing the
   listener (the chain is prepared once).
-- `serve(router, endpoint)` is the blocking helper; `listener` exposes
+- `serve(router, endpoint)` and `serve_tls(router, endpoint, tls_options)` are
+  the blocking helpers; listeners expose
   `valid()/error_code()/port()/run()/stop()`.
+
+## HTTPS and HTTP/2
+
+```cpp
+#include "trie/trie.hh"
+#include "trie/http/tls_listener.hh"   // or define TRIE_TLS_LISTENER_WITH_HTTP2 first
+
+trie::server<api> router;
+trie::http::tls_serve_options options{};
+options.certificate_chain_file = "server.crt";
+options.private_key_file       = "server.key";
+options.verify_client          = false;        // true => require a client cert
+options.ca_file                = "clients.crt"; // for mTLS verification
+options.enable_http2           = true;          // needs nghttp2 + the macro above
+trie::http::tls_listener<trie::server<api>> server{
+    router, trie::http::endpoint{"0.0.0.0", 8443}, options};
+server.run();
+```
+
+Clients negotiate `h2` (when enabled) or fall back to `http/1.1`; the same router,
+middleware, JSON/schema and HEAD/OPTIONS semantics apply to both protocols. The
+listener sets `SIGPIPE` to `SIG_IGN` process-wide because OpenSSL's socket BIO
+cannot use `MSG_NOSIGNAL`.
 
 ## Design
 
@@ -527,15 +570,17 @@ include/trie/
   http/event_loop.hh    epoll event loop + task / io awaiter
   http/listener.hh      listener / connection coroutine / serve() / connection_limiter
   http/threaded_listener.hh  SO_REUSEPORT worker threads + serve_threaded()
+  http/tls_listener.hh  optional OpenSSL HTTPS listener (+ ALPN h2 hook)
+  http/h2.hh            optional nghttp2 HTTP/2 engine (h2_connection)
   http/socket_transport.hh  blocking HTTP/1.1 client transport
   http/pooled_socket_transport.hh  keep-alive pooled client transport
   http/tls_transport.hh     optional OpenSSL TLS client transport
   middleware/sqlite.hh  optional SQLite: database/statement/transaction/middleware
 vendor/nlohmann-json/   nlohmann/json git submodule, pinned to v3.12.0
-tests/                  22 framework-free tests (incl. real-socket, TLS, threaded, fuzz and timeout tests)
+tests/                  25 framework-free tests (incl. real-socket, TLS server/client, HTTP/2, threaded, fuzz and timeout tests)
 examples/               01_hello, 02_params, 03_json_schema, 04_middleware,
-                        05_client, 06_threaded, basic, http_server, sqlite_notes,
-                        chat/chat_server (SQLite-backed browser chat room)
+                        05_client, 06_threaded, 07_https, basic, http_server,
+                        sqlite_notes, chat/chat_server (SQLite-backed browser chat room)
 ```
 
 ## Third-party
@@ -545,14 +590,22 @@ examples/               01_hello, 02_params, 03_json_schema, 04_middleware,
 multi-header distribution; CMake adds `vendor/nlohmann-json/include` to the
 include path. `trie/json.hh` defines `JSON_NOEXCEPTION` before including it.
 
+Optional system dependencies: OpenSSL (TLS client transport + HTTPS listener)
+and nghttp2 (HTTP/2 engine). They are not vendored; the corresponding headers are
+opt-in, so the core library and umbrella include do not require them.
+
 ## Current limitations
 
-- No server-side TLS (HTTPS listener) yet; `tls_transport` is client-side only.
-- The TLS transport does not pool connections (it opens one per request);
-  pooling is available for plain HTTP via `pooled_socket_transport`.
-- No server TLS, HTTP/2 or chunked requests. Multi-threading uses one event loop
-  per worker (SO_REUSEPORT); handlers run on the accepting worker and must be
-  thread-safe. There is no separate handler thread pool.
+- The TLS client transport does not pool connections (it opens one per
+  request); pooling is available for plain HTTP via `pooled_socket_transport`.
+- `tls_listener` is single-threaded; there is no threaded HTTPS listener yet.
+  Multi-threaded plain HTTP uses one event loop per worker (SO_REUSEPORT);
+  handlers run on the accepting worker and must be thread-safe. There is no
+  separate handler thread pool.
+- HTTP/2 is served over TLS/ALPN only (no h2c upgrade or prior knowledge), and
+  does not implement server push, trailers or priority trees. Request bodies are
+  bounded by `serve_options::limits.max_body_bytes`.
+- No chunked HTTP/1.1 request bodies.
 - Schema validation is a built-in validator, not a full JSON Schema engine;
   no multipart or streaming bodies.
 - SQLite middleware supports bound parameters but not typed row/column decoding
