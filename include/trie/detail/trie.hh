@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "trie/detail/reflect.hh"
+#include "trie/http/context.hh"
 
 namespace trie::detail {
 
@@ -153,6 +154,7 @@ struct dispatch_ctx {
   std::size_t arena_used = 0;
   bool bad_request = false;
   std::string bad_request_reason{};
+  http::context* request_context = nullptr;
 
   std::span<char> allocate(std::size_t n) {
     if (arena_used + n > arena.size()) {
@@ -223,6 +225,8 @@ constexpr auto make_arg(dispatch_ctx& c) -> param_type_t<Fn, I> {
     return c.req;
   } else if constexpr (kind == param_kind::response) {
     return c.res;
+  } else if constexpr (kind == param_kind::context) {
+    return *c.request_context->get<U>();
   } else if constexpr (kind == param_kind::path) {
     constexpr std::size_t ordinal = path_ordinal<Fn, I>();
     return make_value<T>(c.captures[ordinal], c);
@@ -304,9 +308,34 @@ void store_result(http::response& res, R&& value) {
   }
 }
 
+template <class T>
+bool context_available(dispatch_ctx& c) {
+  return c.request_context != nullptr && c.request_context->get<T>() != nullptr;
+}
+
+template <std::meta::info Fn, std::size_t... Is>
+bool context_params_available(dispatch_ctx& c, std::index_sequence<Is...>) {
+  bool ok = true;
+  auto check = [&]<std::size_t I>() {
+    if constexpr (kind_of<Fn, I>() == param_kind::context) {
+      using T = std::remove_cvref_t<param_type_t<Fn, I>>;
+      ok = ok && context_available<T>(c);
+    }
+  };
+  (check.template operator()<Is>(), ...);
+  return ok;
+}
+
 template <std::meta::info Fn, class Self, std::size_t... Is>
 void invoke_args(Self& self, dispatch_ctx& c, std::index_sequence<Is...>) {
   using R = return_type_t<Fn>;
+  if constexpr (count_kind<Fn>(param_kind::context) > 0) {
+    if (!context_params_available<Fn>(c, std::make_index_sequence<param_count<Fn>()>{})) {
+      c.res.status_code = static_cast<int>(http::status::internal_server_error);
+      c.res.body = "missing request context";
+      return;
+    }
+  }
   std::tuple<param_type_t<Fn, Is>...> args{make_arg<Fn, Is>(c)...};
   if (c.bad_request) {
     c.res.status_code = static_cast<int>(http::status::bad_request);

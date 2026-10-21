@@ -2,24 +2,39 @@
 
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 #include "trie/detail/trie.hh"
+#include "trie/http/context.hh"
 
 namespace trie {
 
-// A router over one or more controller classes. The complete routing table is
-// a compile-time trie: every path segment becomes a template instantiation, so
-// matching never walks a runtime table.
+// A router over one or more controller classes, plus a Spring-like middleware
+// chain. The complete routing table is a compile-time trie: every path segment
+// becomes a template instantiation, so matching never walks a runtime table.
 //
 //   struct api { [[=trie::get("/users/{id}")]] int user(int id); };
 //   trie::server<api> srv;
+//   srv.use(auth_middleware{"secret"});
 //   auto res = srv.dispatch(trie::method::get, "/users/42");
 template <class... Cs>
 class server {
 public:
+  using next_t = http::next;
+  using middleware_function =
+      std::function<http::response(http::context&, const http::request_view&, const next_t&)>;
+
+  server() = default;
+  server(server const&) = delete;
+  server& operator=(server const&) = delete;
+  server(server&&) = delete;
+  server& operator=(server&&) = delete;
+
   using controllers_t = std::tuple<Cs...>;
 
   static_assert(sizeof...(Cs) > 0, "trie::server requires at least one controller class");
@@ -30,60 +45,25 @@ public:
   static_assert(detail::controller_set<controllers_t>::unique(), "duplicate (method, path) route");
   static_assert(detail::controller_set<controllers_t>::arity_ok(), "route path is too long (max 95 characters)");
 
+  // Appends a middleware; the first `use` call is the outermost middleware.
+  // A middleware is any callable `(http::context&, const http::request_view&,
+  // const http::next&) -> http::response`.
+  template <class M>
+  server& use(M middleware) {
+    middlewares_.push_back(
+        [mw = std::move(middleware)](http::context& context, const http::request_view& request,
+                                     const next_t& next) mutable -> http::response {
+          return mw(context, request, next);
+        });
+    chain_valid_ = false;
+    return *this;
+  }
+
   http::response dispatch(const http::request_view& request) {
-    http::response response{};
-    std::array<std::string_view, max_path_segments> segments{};
-    std::size_t segment_count = 0;
-    if (!split_path(request.path, segments, segment_count)) {
-      response.status_code = static_cast<int>(http::status::bad_request);
-      response.body = "bad request";
-      return response;
-    }
-
-    detail::dispatch_ctx ctx{request,
-                             response,
-                             std::span<const std::string_view>{segments}.first(segment_count),
-                             {},
-                             0,
-                             {},
-                             0,
-                             false};
-
-    bool matched = dispatch_method(request.m, ctx);
-    if (matched) return response;
-    if (ctx.bad_request) {
-      response.status_code = static_cast<int>(http::status::bad_request);
-      response.body = "bad request";
-      return response;
-    }
-
-    detail::dispatch_ctx probe{request,
-                               response,
-                               ctx.segments,
-                               {},
-                               0,
-                               {},
-                               0,
-                               false};
-    std::string allow;
-    bool path_exists = false;
-    static constexpr std::array<method, method_count> all_methods{
-        method::get, method::post, method::put, method::patch, method::del, method::head, method::options};
-    for (method m : all_methods) {
-      if (!probe_method(m, probe)) continue;
-      path_exists = true;
-      if (!allow.empty()) allow += ", ";
-      allow += http::method_name(m);
-    }
-
-    if (path_exists) {
-      response.status_code = static_cast<int>(http::status::method_not_allowed);
-      response.set_header("Allow", std::move(allow));
-    } else {
-      response.status_code = static_cast<int>(http::status::not_found);
-      response.body = "not found";
-    }
-    return response;
+    http::context context{};
+    if (middlewares_.empty()) return dispatch_impl(request, context);
+    ensure_chain();
+    return chain_(context, request);
   }
 
   http::response dispatch(method m, std::string_view target) {
@@ -116,6 +96,83 @@ private:
       path = slash == std::string_view::npos ? std::string_view{} : path.substr(slash + 1);
     }
     return true;
+  }
+
+  http::response dispatch_impl(const http::request_view& request, http::context& context) {
+    http::response response{};
+    std::array<std::string_view, max_path_segments> segments{};
+    std::size_t segment_count = 0;
+    if (!split_path(request.path, segments, segment_count)) {
+      response.status_code = static_cast<int>(http::status::bad_request);
+      response.body = "bad request";
+      return response;
+    }
+
+    detail::dispatch_ctx ctx{request,
+                             response,
+                             std::span<const std::string_view>{segments}.first(segment_count),
+                             {},
+                             0,
+                             {},
+                             0,
+                             false,
+                             {},
+                             &context};
+
+    bool matched = dispatch_method(request.m, ctx);
+    if (matched) return response;
+    if (ctx.bad_request) {
+      response.status_code = static_cast<int>(http::status::bad_request);
+      response.body = ctx.bad_request_reason.empty() ? "bad request" : ctx.bad_request_reason;
+      return response;
+    }
+
+    detail::dispatch_ctx probe{request,
+                               response,
+                               ctx.segments,
+                               {},
+                               0,
+                               {},
+                               0,
+                               false,
+                               {},
+                               nullptr};
+    std::string allow;
+    bool path_exists = false;
+    static constexpr std::array<method, method_count> all_methods{
+        method::get, method::post, method::put, method::patch, method::del, method::head, method::options};
+    for (method m : all_methods) {
+      if (!probe_method(m, probe)) continue;
+      path_exists = true;
+      if (!allow.empty()) allow += ", ";
+      allow += http::method_name(m);
+    }
+
+    if (path_exists) {
+      response.status_code = static_cast<int>(http::status::method_not_allowed);
+      response.set_header("Allow", std::move(allow));
+    } else {
+      response.status_code = static_cast<int>(http::status::not_found);
+      response.body = "not found";
+    }
+    return response;
+  }
+
+  void ensure_chain() {
+    if (chain_valid_) return;
+    next_t next = [this](http::context& context, const http::request_view& request) {
+      return dispatch_impl(request, context);
+    };
+    for (auto iterator = middlewares_.rbegin(); iterator != middlewares_.rend(); ++iterator) {
+      middleware_function current = *iterator;
+      next_t previous = std::move(next);
+      next = [current = std::move(current), previous = std::move(previous)](
+                 http::context& context, const http::request_view& request) -> http::response {
+        return current(context, request, previous);
+      };
+    }
+    chain_ = std::move(next);
+    chain_valid_ = true;
   }
 
   bool dispatch_method(method m, detail::dispatch_ctx& ctx) {
@@ -161,6 +218,9 @@ private:
   }
 
   std::tuple<Cs...> controllers_{};
+  std::vector<middleware_function> middlewares_{};
+  next_t chain_{};
+  bool chain_valid_ = false;
 };
 
 } // namespace trie

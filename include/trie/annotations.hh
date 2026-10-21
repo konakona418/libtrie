@@ -90,6 +90,11 @@ struct header_t {
 struct body_t {};
 inline constexpr body_t body{};
 
+// Marks a handler parameter as a request-scoped value provided by middleware
+// (see trie::http::context). Handlers receive it by lvalue reference.
+struct inject_t {};
+inline constexpr inject_t inject{};
+
 consteval query_t query(const char* n) { return query_t{n}; }
 consteval header_t header(const char* n) { return header_t{n}; }
 

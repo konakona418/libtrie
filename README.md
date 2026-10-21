@@ -1,52 +1,76 @@
 # libtrie
 
-基于 C++26 反射（P2996 + P3394 annotations + P1306 expansion statements）的 HTTP 框架：
+A C++26 reflection HTTP framework built on P2996 (reflection), P3394
+(annotations) and P1306 (expansion statements):
 
-- **编译期路由**：handler 上的 `[[=trie::get("/users/{id}")]]` 注解在编译期变成一棵 trie，
-  匹配过程是一条静态嵌套调用链，不遍历运行时表。
-- **HTTP/1.1 传输层**：C++20 coroutine + epoll 实现，单线程事件循环，每条连接一个 coroutine。
-- **JSON**：基于 vendored nlohmann-json，并用反射在聚合类型和 JSON 之间自动转换。
-- **类型安全客户端**：由同一份反射信息生成 method / path / 参数 / 返回类型，编译期校验。
+- **Compile-time routing.** `[[=trie::get("/users/{id}")]]` annotations on
+  handler methods become a trie at compile time. Matching is a chain of static
+  nested calls, not a runtime table lookup.
+- **HTTP/1.1 transport.** A blocking server built on C++20 coroutines + epoll
+  (one coroutine per connection, single-threaded event loop).
+- **JSON.** Vendored [nlohmann/json](https://github.com/nlohmann/json) plus a
+  reflection layer that converts aggregate types to/from JSON.
+- **Schema validation.** Typed request bodies are validated against a schema
+  derived from the C++ type before the handler runs.
+- **Middleware.** Spring-like request-scoped context injection
+  (`[[=trie::inject]] T&`), an ordered middleware chain, and an optional SQLite
+  transaction middleware.
+- **Type-safe client.** Method, path, parameters and return type come from the
+  same reflection metadata; calls are checked at compile time. Ships with a
+  blocking `socket_transport` and a pluggable transport concept.
 
-## 环境要求
+## Requirements
 
-- **GCC 16 或更新版本**（使用 `-freflection`）。
-- CMake ≥ 3.23。
-- **Linux**（HTTP transport 基于 epoll；路由/JSON/客户端本身是平台无关的）。
-- 不支持系统 clang：stock clang 没有实现反射。clangd 同样无法解析这些语法，
-  编辑器里会有误报；请以 `cmake --preset dev` 的编译结果为准。
+- **GCC 16 or newer** with `-freflection`.
+- CMake ≥ 3.23 and Ninja (the `dev` preset uses Ninja).
+- **Linux** for the HTTP transport (epoll). Routing, JSON, middleware and the
+  client core are platform-independent.
+- Optional: SQLite 3 development files for the SQLite middleware example/test.
 
-## 构建与测试
+Stock Clang does not implement P2996 yet; clangd cannot parse `^^`/`[[=...]]`
+either, so expect editor false positives. The build is the source of truth.
+
+The JSON dependency is a git submodule, so clone/track it first:
 
 ```sh
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
-
-# 启动示例服务
-./build/dev/examples/trie_http_server 8080
-curl http://127.0.0.1:8080/hello
-curl -X POST -H 'Content-Type: application/json' \
-     -d '{"name":"a","age":1}' http://127.0.0.1:8080/person
+git submodule update --init --recursive
 ```
 
-## 快速开始
+## Build and test
 
-### 路由 + HTTP server
+```sh
+git submodule update --init --recursive
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev            # 13 tests, including real-socket integration tests
+```
+
+Examples:
+
+```sh
+./build/dev/examples/trie_basic
+./build/dev/examples/trie_http_server 8080        # routes, JSON, schema, middleware
+./build/dev/examples/trie_sqlite_notes 8081       # SQLite transaction middleware
+```
+
+## Quick start
+
+### Router + HTTP server
 
 ```cpp
 #include "trie/trie.hh"
 
 struct person {
-  std::string name;
-  int age = 0;
+  std::string name;          // no default -> required in JSON bodies
+  int age = 0;               // defaulted -> optional
 };
 
 struct users_api {
   [[=trie::get("/users/{id}")]]
   int get_user(int id) { return id * 2; }
 
-  // 请求体反序列化成 person，返回值序列化成 JSON（Content-Type: application/json）。
+  // Typed JSON request/response. The body is schema-validated and the return
+  // value is serialized with Content-Type: application/json.
   [[=trie::post("/person")]]
   person bump_age([[=trie::body]] person value) {
     value.age += 1;
@@ -60,28 +84,108 @@ struct users_api {
 
 int main() {
   trie::server<users_api> router;
-  trie::http::serve(router, trie::http::endpoint{"127.0.0.1", 8080});   // 阻塞
+  trie::http::serve(router, trie::http::endpoint{"127.0.0.1", 8080});   // blocking
 }
 ```
 
-需要控制生命周期（例如测试里用 0 端口、从别的线程 `stop()`）时直接用 `listener`：
+For lifecycle control (testing, port 0, stopping from another thread) use the
+listener directly:
 
 ```cpp
 trie::http::listener<trie::server<users_api>> server{router, {"127.0.0.1", 0}};
 std::thread thread{[&] { server.run(); }};
-// ... server.port() 是实际绑定的端口 ...
-server.stop();
+auto port = server.port();          // actual bound port
+server.stop();                      // safe from another thread
 thread.join();
 ```
 
-多个 controller 直接作为模板参数组合：`trie::server<users_api, admin_api>`。
-同一个 `(method, path)` 重复注册是编译错误。
+Multiple controllers are composed as template arguments:
+`trie::server<users_api, admin_api>`. Registering the same `(method, path)`
+twice is a compile error.
+
+### Middleware and request context
+
+Middleware is any callable with the signature
+`(http::context&, const http::request_view&, const http::next&) -> http::response`.
+The first `use` call is the outermost middleware; a middleware decides whether
+to call `next(context, request)`, may short-circuit, and may modify the response
+afterwards.
+
+```cpp
+struct request_info {
+  int number = 0;
+};
+
+struct counting_middleware {
+  int count = 0;
+
+  trie::http::response operator()(trie::http::context& context,
+                                  const trie::http::request_view& request,
+                                  const trie::http::next& next) {
+    context.set<request_info>(request_info{++count});   // owned value
+    return next(context, request);                      // or short-circuit here
+  }
+};
+
+struct api {
+  [[=trie::get("/request-number")]]
+  int number([[=trie::inject]] request_info const& info) { return info.number; }
+};
+
+int main() {
+  trie::server<api> router;
+  router.use(counting_middleware{});
+  trie::http::serve(router, {"127.0.0.1", 8080});
+}
+```
+
+- `context.set<T>(value)` stores an owned request-scoped value;
+  `context.set_ref<T>(ref)` stores a borrowed one.
+- Handlers receive values with `[[=trie::inject]] T&` / `T const&`.
+- A handler using an injected type with no middleware providing it returns
+  `500 missing request context`.
+- Authentication is a natural middleware: inspect `request.header("X-Token")`
+  and return `401` without calling `next`.
+
+### SQLite middleware
+
+`include/trie/middleware/sqlite.hh` is an optional, header-only module (the only
+libtrie header that includes `<sqlite3.h>`; link with `-lsqlite3`):
+
+```cpp
+#include "trie/middleware/sqlite.hh"
+
+struct notes_api {
+  [[=trie::post("/notes")]]
+  trie::json::value add([[=trie::inject]] trie::sqlite::transaction& tx,
+                        [[=trie::body]] note_input input) {
+    auto result = tx.exec("INSERT INTO notes(text) VALUES(...)");
+    // returning a response with status >= 500 makes the middleware roll back
+    return trie::json::value{{"ok", result.has_value()}};
+  }
+};
+
+int main() {
+  trie::sqlite::database db;
+  (void)db.open("notes.db");
+  (void)db.exec("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, text TEXT)");
+
+  trie::server<notes_api> router;
+  router.use(trie::sqlite::middleware{&db});   // BEGIN IMMEDIATE ... COMMIT/ROLLBACK
+  trie::http::serve(router, {"127.0.0.1", 8080});
+}
+```
+
+`trie::sqlite::middleware` opens a transaction per request
+(`BEGIN IMMEDIATE`), injects `trie::sqlite::transaction&`, commits on
+responses below 500 and rolls back on 5xx (or when a handler never finishes the
+transaction). `transaction` and `database` expose `exec()` / `query()` with
+`std::expected` results; rows are `std::vector<std::optional<std::string>>`.
+Parameter binding is not implemented yet.
 
 ### JSON
 
 ```cpp
-#include "trie/trie.hh"
-
 struct person {
   std::string name;
   int age = 0;
@@ -89,53 +193,56 @@ struct person {
   std::vector<std::string> tags;
 };
 
-// 反射驱动：聚合类型的 public 非静态成员 -> JSON object
 trie::json::value document = trie::json::to_json(person{"a", 1, std::nullopt, {"x"}});
 std::string text = trie::json::dump(document);
 
-// 解析 + 反序列化（失败返回 std::expected，不抛异常）
-auto parsed = trie::json::parse_as<person>(text);
-if (parsed) { /* parsed->name ... */ }
-
-// 通用 JSON
-auto value = trie::json::parse(R"({"ok":true})");
-if (value) { bool ok = (*value)["ok"].get<bool>(); }
+auto parsed = trie::json::parse_as<person>(text);   // expected<person, json::error>
+auto value  = trie::json::parse(R"({"ok":true})");  // expected<json::value, json::error>
 ```
 
-- `trie::json::value` 就是 `nlohmann::json`，可以直接用 nlohmann API。
-- JSON 响应由返回类型决定：返回 `trie::json::value` 或任意可序列化聚合/容器/枚举 →
-  `Content-Type: application/json`；返回字符串/数值/void/`http::status` 走文本/状态规则。
-- `trie::body` 参数支持：`std::string` / `std::string_view`（原始 body）、`trie::json::value`
-  以及任意可反序列化聚合类型（JSON），解析失败 → 400，handler 不会被调用。
-- `parse_as<T>` 会拒绝包含 `string_view`/`const char*` 的类型（避免悬垂视图）。
+- `trie::json::value` is `nlohmann::json`; the nlohmann API is available.
+- Conversion rules: fundamentals, strings, enums (by enumerator name),
+  `std::optional`, `std::vector`, `std::array`, and aggregate classes whose
+  public non-static data members are serializable.
+- `parse_as<T>` rejects types that would borrow parsed storage
+  (`string_view`/`const char*` members) to prevent dangling views.
+- All JSON errors are returned as `std::expected`; nothing throws or aborts.
 
-### Schema 校验
+### Schema validation
 
-`[[=trie::body]] T` 的 JSON body 会先经过反射生成的 schema 校验，再反序列化：
+`[[=trie::body]] T` bodies are validated before conversion:
 
-- 未知字段默认拒绝（`reject_unknown = true`）；
-- 必填字段 = 没有默认成员初始化器且不是 `std::optional`（`require_all = true` 可要求全部字段）；
-- 类型、整数范围、枚举名、`std::vector` 元素、`std::array` 长度、嵌套对象路径都会检查；
-- 失败返回 `400`，响应体是带路径的错误信息，handler 不会被调用，例如：
-  `home.zip: expected integer, got string`、`points[0].y: missing required field`、
-  `unknown field 'extra'`、`favorite: unknown enumerator 'purple'`。
+- unknown fields are rejected by default (`reject_unknown = true`);
+- a field is required when it has no default member initializer and is not
+  `std::optional` (`require_all = true` makes every field required);
+- type, integer range, enum names, vector elements, `std::array` length and
+  nested object paths are checked;
+- failures return `400` with a path-aware message and never call the handler:
 
-也可以直接使用校验和 schema 生成 API：
+```
+home.zip: expected integer, got string
+points[0].y: missing required field
+unknown field 'extra'
+favorite: unknown enumerator 'purple'
+```
 
 ```cpp
-auto document = trie::json::parse(body);
-if (auto valid = trie::json::validate<person>(*document); !valid) {
-  // valid.error().message
-}
-
+auto valid = trie::json::validate<person>(*document);  // expected<void, error>
 trie::json::value description = trie::json::schema<person>();
-// {"type":"object","properties":{...},"required":[...],"additionalProperties":false}
+// {"type":"object","properties":{...},"required":["name"],"additionalProperties":false}
 ```
 
-`validate<T>(value, {.reject_unknown, .require_all})` 可调整严格程度；
-`schema<T>()` 输出 draft-07 风格的 object/properties/required/items/enum/minItems/maxItems。
+`validate<T>(value, {.reject_unknown, .require_all})` adjusts strictness;
+`schema<T>()` emits draft-07-style object/properties/required/items/enum/
+minItems/maxItems.
 
-### 类型安全客户端
+### Type-safe client
+
+The client derives method, path template, argument types and return type from
+the handler reflection. Arguments must match the handler's non-context
+parameters exactly; this is checked at compile time. Calls return
+`std::expected<T, client_error>` (2xx is success, anything else carries the
+status and body).
 
 ```cpp
 struct loopback_transport {
@@ -148,29 +255,23 @@ struct loopback_transport {
   }
 };
 
-trie::client<users_api, loopback_transport> client{loopback_transport{&server}};
-
-auto user = client.call<^^users_api::get_user>(21);        // expected<int, client_error>
-auto person = client.call<^^users_api::bump_age>(p);       // expected<person, client_error>
+trie::client<users_api, loopback_transport> client{loopback_transport{&router}};
+auto user   = client.call<^^users_api::get_user>(21);   // expected<int, client_error>
+auto person = client.call<^^users_api::bump_age>(p);    // expected<person, client_error>
 ```
 
-打真实服务端时用内置的阻塞 transport（每请求一个连接，`Connection: close`）：
+To talk to a real server, use the built-in blocking transport (one connection
+per request, `Connection: close`):
 
 ```cpp
 trie::client<users_api, trie::http::socket_transport> http_client{
     trie::http::socket_transport{trie::http::endpoint{"127.0.0.1", 8080}}};
 
 auto user = http_client.call<^^users_api::get_user>(21);
-auto person = http_client.call<^^users_api::bump_age>(p);
 ```
 
-`socket_transport` 支持 connect / IO 超时和响应大小上限：
-`trie::http::socket_transport_options{connect_timeout_ms, io_timeout_ms, max_response_bytes}`。
-
-- 实参必须严格对应 handler 的非 context 参数，个数/类型编译期校验。
-- query/header 注解同时驱动请求构造；路径参数自动百分号编码；JSON body/返回值自动编解码。
-- 返回 `std::expected<T, trie::client_error>`：2xx 成功，否则 `client_error{status, body}`。
-- Transport 只要求：
+`socket_transport_options{connect_timeout_ms, io_timeout_ms, max_response_bytes}`
+configures timeouts and response size limits. The transport concept is:
 
 ```cpp
 template <class T>
@@ -179,120 +280,134 @@ concept transport = requires(T& t, trie::http::request request) {
 };
 ```
 
-## 参数注入规则
+## Parameter injection
 
-| 参数写法 | 来源 |
+| Parameter | Source |
 | --- | --- |
-| `trie::http::request_view const&` | 当前请求 |
-| `trie::http::response&` | 待填写的响应 |
-| `int id` / `std::string_view name` | 路径参数，按 `{placeholder}` 顺序 |
-| `[[=trie::query("q")]] std::string_view q` | query 参数（自动百分号解码） |
-| `[[=trie::query("limit")]] std::optional<int> limit` | 可选 query 参数，缺失时为 `nullopt` |
-| `[[=trie::header("X-Token")]] std::string_view token` | 请求头（大小写不敏感，自动解码） |
-| `[[=trie::body]] std::string_view body` | 原始请求体 |
-| `[[=trie::body]] person body` | JSON 请求体（反序列化为 `person`） |
+| `trie::http::request_view const&` | current request |
+| `trie::http::response&` | response to fill |
+| `int id` / `std::string_view name` | path parameter, positional (`{placeholder}`) |
+| `[[=trie::query("q")]] std::string_view q` | query parameter (percent-decoded) |
+| `[[=trie::query("limit")]] std::optional<int> limit` | optional query parameter |
+| `[[=trie::header("X-Token")]] std::string_view token` | request header (case-insensitive, decoded) |
+| `[[=trie::body]] std::string_view body` | raw request body |
+| `[[=trie::body]] person body` | JSON body (parsed, schema-validated) |
+| `[[=trie::inject]] app_state& state` | request-scoped context value from middleware |
 
-路径/query/header 支持：整型、浮点、`bool`、`std::string`、`std::string_view`、
-**枚举**及 `std::optional<T>`。枚举默认按枚举项标识符解析（`/colors/green`），
-找不到时回退到底层整数值；客户端会自动把枚举序列化成同样的形式：
+Path/query/header value types: integers, floats, `bool`, `std::string`,
+`std::string_view`, enums and `std::optional<T>`. Enums parse from enumerator
+identifiers (e.g. `/colors/green`) with a numeric fallback; the client serializes
+the same way. `trie::enum_name(value)` / `trie::enum_from_name<E>(name)` are
+public helpers. Path placeholder count must match the handler's path parameter
+count, otherwise compilation fails.
 
-```cpp
-enum class color { red, green, blue };
+## Handler return values
 
-[[=trie::get("/colors/{c}")]] std::string color_path(color c) {
-  return std::string(trie::enum_name(c));       // "green"
-}
-```
-
-`trie::enum_name(value)` / `trie::enum_from_name<E>(name)` 也可在业务代码里使用。
-路径参数个数必须与 `{placeholder}` 个数一致，否则编译期 `static_assert`。
-
-## 返回值规则
-
-| 返回类型 | 行为 |
+| Return type | Behaviour |
 | --- | --- |
-| `void` | handler 自行填写 `response` |
-| `std::string` / `std::string_view` / `const char*` | 文本响应体 |
-| 整型 / 浮点 / `bool` | 转文本响应体 |
-| `trie::http::status` | 设置状态码 |
-| `trie::json::value` | JSON 响应体 |
-| 可序列化聚合/容器/枚举 | 反射转 JSON 响应体 |
+| `void` | handler fills `response` itself |
+| `std::string` / `std::string_view` / `const char*` | text response body |
+| integers / floats / `bool` | text response body |
+| `trie::http::status` | sets the status code |
+| `trie::json::value` | JSON response body |
+| serializable aggregate/container/enum | reflection-serialized JSON response body |
 
 ## HTTP transport
 
-- HTTP/1.1：keep-alive、pipelining（顺序处理）、HEAD（只发头部）、`Content-Length`。
-- 请求限制：header 16 KiB、body 1 MiB、target 8 KiB；路径最多 32 段，单段 24 字节。
-- 状态码：404 / 405（带 `Allow`）/ 400 / 413 / 414 / 431 / 501 / 505。
-- 单线程 epoll 事件循环，每条连接一个 coroutine；`listener::stop()` 可从其他线程调用。
-  不支持 TLS、HTTP/2、chunked 请求体。
-- `serve(router, endpoint)` 是阻塞封装；`listener` 提供 `valid()/error_code()/port()/run()/stop()`。
-- 客户端侧提供 `trie::http::socket_transport`：阻塞 HTTP/1.1 client transport，
-  每请求新建连接并发送 `Connection: close`，读取 Content-Length 或 EOF，无连接池、无 TLS。
+- HTTP/1.1: keep-alive, pipelining (sequential), HEAD (headers only),
+  `Content-Length`.
+- Request limits: 16 KiB headers, 1 MiB body, 8 KiB target; at most 32 path
+  segments; 24 bytes per segment.
+- Status handling: 404, 405 (with `Allow`), 400, 401, 413, 414, 431, 500, 501,
+  505.
+- Single-threaded epoll loop, one coroutine per connection;
+  `listener::stop()` may be called from another thread.
+- No TLS, HTTP/2, chunked request bodies, timeouts or connection limits.
+- `serve(router, endpoint)` is the blocking helper; `listener` exposes
+  `valid()/error_code()/port()/run()/stop()`.
 
-## 设计
+## Design
 
 ```
-编辑期               编译期                                   运行期
-annotations  ──►  members_of / annotations_of  ──►  trie 节点数组（NTTP）
-                                                      │
-                                                      ├─ 每个节点一个模板实例
-                                                      └─ template for 展开子节点 → 静态嵌套调用
-                                                                 │
-                                                      handler 参数由 parameters_of + type_of 推导
+edit time            compile time                                 runtime
+annotations  ──►  members_of / annotations_of  ──►  trie node array (NTTP)
+                                                     │
+                                                     ├─ one template instance per node
+                                                     └─ template for expands children
+                                                        → static nested calls
+                                                              │
+                                                     handler params from
+                                                     parameters_of + type_of
 
-socket ──► epoll ──► connection coroutine ──► http parser ──► request_view
-                                                              │
-                                                    server<...>::dispatch
-                                                              │
-                                          response ──► serializer ──► socket
+socket ──► epoll ──► connection coroutine ──► parser ──► request_view
+                                                            │
+                                                   middleware chain
+                                                            │
+                                                 server<...>::dispatch
+                                                            │
+                                        response ──► serializer ──► socket
 ```
 
-- 路由注解类型必须 structural：路径/名称存进 `std::array<char, N>`，**不能用 `const char*`**
-  （两个编译器都无法 reflect 指向字符串字面量的指针）。
-- 注解返回类型是 `const route`，比较时先 `remove_const`。
-- 反射返回的 `std::vector` 不能存进 `constexpr` 变量；内部统一用 `define_static_array` 或
-  `consteval` 查询函数。
-- `-fno-exceptions` / `-fno-rtti` 下可用；反射错误是编译期硬错误。
-- handler 必须是 public（`access_context::unprivileged()`）且至少有一个路由注解。
-- 编译期会裁掉未使用的方法和该方法的路径子树。
+- Route annotations must be structural types. Paths/names live in
+  `std::array<char, N>`; pointers to string literals cannot be reflected.
+- The reflected annotation type is `const route`, so comparisons use
+  `remove_const`.
+- Reflection vectors cannot be stored in `constexpr` variables; the code uses
+  `define_static_array` or `consteval` lookup functions instead.
+- Everything works with `-fno-exceptions -fno-rtti`; reflection errors are hard
+  compile errors.
+- Handlers must be public (`access_context::unprivileged()`) and carry at least
+  one route annotation.
+- Unused methods and path subtrees are pruned at compile time.
 
-## 目录
+## Layout
 
 ```
 include/trie/
-  annotations.hh        route / method / query / header / body 注解
-  http.hh               request_view / request / response
-  json.hh               trie::json（nlohmann 适配 + 反射 to_json/from_json）
-  server.hh             server<Controllers...>：404/405 与请求分派
-  client.hh             client<Api, Transport>：类型安全客户端
-  trie.hh               总入口
+  annotations.hh        route / method / query / header / body / inject annotations
+  http.hh               request_view / request / response / status / method helpers
+  json.hh               trie::json: nlohmann adapter, reflection conversion, schema
   error.hh              client_error
-  detail/reflect.hh     反射元数据、参数分类、static_assert 校验
-  detail/trie.hh        编译期 trie、静态 dispatch、参数转换
-  detail/enum.hh        枚举名表、enum_name / enum_from_name
-  detail/url.hh         百分号编解码
-  http/parser.hh        增量 HTTP/1.1 请求解析
-  http/serializer.hh    响应序列化
-  http/event_loop.hh    epoll 事件循环 + task / io awaiter
+  server.hh             server<Controllers...>: middleware chain, 404/405, dispatch
+  client.hh             client<Api, Transport>: type-safe client
+  trie.hh               umbrella header
+  detail/reflect.hh     reflection metadata, parameter classification, static checks
+  detail/trie.hh        compile-time trie, static dispatch, argument conversion
+  detail/enum.hh        enumerator name tables, enum_name / enum_from_name
+  detail/url.hh         percent encoding/decoding
+  http/parser.hh        incremental HTTP/1.1 request parser
+  http/serializer.hh    response serializer
+  http/context.hh       request-scoped context + middleware next function
+  http/event_loop.hh    epoll event loop + task / io awaiter
   http/listener.hh      listener / connection coroutine / serve()
-  http/socket_transport.hh  阻塞 HTTP/1.1 客户端 transport
-vendor/nlohmann/        nlohmann-json 3.12.0（MIT）
-tests/                  11 个无需第三方框架的测试（含真实 socket 集成测试）
-examples/basic.cc       纯路由 + loopback 客户端
-examples/http_server.cc coroutine/epoll 服务端 + JSON 示例
+  http/socket_transport.hh  blocking HTTP/1.1 client transport
+  middleware/sqlite.hh  optional SQLite database/transaction/middleware
+vendor/nlohmann-json/   nlohmann/json git submodule, pinned to v3.12.0
+tests/                  13 framework-free tests (incl. real-socket integration)
+examples/               basic routing, HTTP server (JSON/schema/middleware),
+                        SQLite notes server
 ```
 
-## 第三方
+## Third-party
 
-- [nlohmann/json](https://github.com/nlohmann/json) 3.12.0，MIT，位于 `vendor/nlohmann/`。
-  通过 `-Ivendor/nlohmann` 引入；`trie/json.hh` 会定义 `JSON_NOEXCEPTION` 后再包含它。
+[`nlohmann/json`](https://github.com/nlohmann/json) is a git submodule at
+`vendor/nlohmann-json`, pinned to tag `v3.12.0` (MIT). The repository ships the
+multi-header distribution; CMake adds `vendor/nlohmann-json/include` to the
+include path. `trie/json.hh` defines `JSON_NOEXCEPTION` before including it.
 
-## 当前限制
+## Current limitations
 
-- 只有服务端 transport；类型安全客户端自带 transport concept（示例用 loopback）。
-- 单线程事件循环；没有 TLS / HTTP/2 / chunked 请求体 / 超时与连接数上限。
-- schema 校验是内建校验器（不是完整 JSON Schema draft 引擎）；没有 multipart、streaming body。
-- 路径参数与 query/header 参数不支持自定义类型（枚举已支持；JSON body 支持更复杂的类型）。
-- 路由模板上限 95 字符、路径 32 段、handler 参数 12 个。
-- 编译期成本随路由数增长；未使用方法和路径子树会被裁剪。实测 24 条 GET 路由约 5 s，
-  28 条覆盖 7 个方法的路由约 5 s（GCC 16.2，`-O0`，包含 nlohmann-json 头文件的解析成本）。
+- Server transport only; the client uses the transport concept (loopback and
+  blocking TCP transports are provided).
+- Single-threaded event loop; no TLS, HTTP/2, chunked requests, timeouts or
+  connection limits.
+- Schema validation is a built-in validator, not a full JSON Schema engine;
+  no multipart or streaming bodies.
+- SQLite middleware has no prepared-statement binding (raw `exec`/`query` only).
+- Path/query/header parameters do not support arbitrary user-defined types
+  (enums are supported; JSON bodies support much richer types).
+- Route templates are limited to 95 characters, 32 path segments and 12 handler
+  parameters.
+- Compile time grows with the number of routes (unused methods/subtrees are
+  pruned). Measured on GCC 16.2 at `-O0`, including nlohmann header parsing:
+  ~5 s for 24 GET routes, ~5 s for 28 routes covering all 7 methods.

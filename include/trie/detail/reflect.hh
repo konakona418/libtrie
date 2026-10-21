@@ -148,7 +148,7 @@ consteval route route_annotation() {
 // Handler parameter classification
 // ---------------------------------------------------------------------------
 
-enum class param_kind : unsigned char { request, response, path, query, header, body };
+enum class param_kind : unsigned char { request, response, context, path, query, header, body };
 
 template <class>
 struct is_optional : std::false_type {};
@@ -222,6 +222,8 @@ consteval param_desc describe_param() {
         d.valid = h.valid;
       } else if constexpr (ty == ^^body_t) {
         d.kind = param_kind::body;
+      } else if constexpr (ty == ^^inject_t) {
+        d.kind = param_kind::context;
       } else if constexpr (ty == ^^from_path_t) {
         d.kind = param_kind::path;
       }
@@ -258,7 +260,7 @@ consteval std::size_t count_kind(param_kind k) {
 template <std::meta::info Fn, std::size_t I>
 consteval bool is_context_param() {
   constexpr auto k = kind_of<Fn, I>();
-  return k == param_kind::request || k == param_kind::response;
+  return k == param_kind::request || k == param_kind::response || k == param_kind::context;
 }
 
 template <std::meta::info Fn, std::size_t... Js>
@@ -333,6 +335,8 @@ consteval bool param_ok() {
   constexpr auto d = describe_param<Fn, I>();
   if constexpr (d.kind == param_kind::request || d.kind == param_kind::response) {
     return true;
+  } else if constexpr (d.kind == param_kind::context) {
+    return std::is_lvalue_reference_v<T>;
   } else if constexpr (std::is_reference_v<T>) {
     return false;
   } else {

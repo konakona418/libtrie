@@ -12,6 +12,22 @@ struct person {
 
 enum class color { red, green, blue };
 
+struct request_info {
+  int number = 0;
+};
+
+// Middleware can put per-request values into the context; handlers receive them
+// with [[=trie::inject]].
+struct counting_middleware {
+  int count = 0;
+
+  trie::http::response operator()(trie::http::context& context, const trie::http::request_view& request,
+                                  const trie::http::next& next) {
+    context.set<request_info>(request_info{++count});
+    return next(context, request);
+  }
+};
+
 struct demo_api {
   [[=trie::get("/hello")]] std::string hello() { return "hello, world"; }
 
@@ -23,6 +39,10 @@ struct demo_api {
 
   [[=trie::get("/person/schema")]] trie::json::value person_schema() {
     return trie::json::schema<person>();
+  }
+
+  [[=trie::get("/request-number")]] int request_number([[=trie::inject]] request_info const& info) {
+    return info.number;
   }
 
   // Typed JSON: the request body is deserialized into `person`, and the response
@@ -41,6 +61,7 @@ struct demo_api {
 int main(int argc, char** argv) {
   const std::uint16_t port = argc > 1 ? static_cast<std::uint16_t>(std::atoi(argv[1])) : 8080;
   trie::server<demo_api> router;
+  router.use(counting_middleware{});
   trie::http::listener<trie::server<demo_api>> server{router, trie::http::endpoint{"127.0.0.1", port}};
   if (!server.valid()) {
     std::printf("failed to bind 127.0.0.1:%u\n", static_cast<unsigned>(port));
@@ -53,6 +74,7 @@ int main(int argc, char** argv) {
               static_cast<unsigned>(server.port()));
   std::printf("  curl http://127.0.0.1:%u/color/green\n", static_cast<unsigned>(server.port()));
   std::printf("  curl http://127.0.0.1:%u/person/schema\n", static_cast<unsigned>(server.port()));
+  std::printf("  curl http://127.0.0.1:%u/request-number\n", static_cast<unsigned>(server.port()));
   server.run();
   return 0;
 }

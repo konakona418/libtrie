@@ -19,6 +19,7 @@ enum class status : int {
   accepted = 202,
   no_content = 204,
   bad_request = 400,
+  unauthorized = 401,
   not_found = 404,
   method_not_allowed = 405,
   payload_too_large = 413,
